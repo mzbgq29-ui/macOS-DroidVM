@@ -1,0 +1,214 @@
+name: Build a complete importable macOS package
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Reviewed image workflow run (the image itself is not rebuilt)
+        type: string
+        required: true
+        default: '44723953351'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: build-vmpkg-${{ inputs.source_run }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_RUN: ${{ inputs.source_run }}
+      WORK: ${{ github.workspace }}/vmpkg-work
+      PACKAGE_NAME: macOS-27.2-DroidVM.vmpkg
+    steps:
+      - name: Check out reviewed host tools and portable VM manifest
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/vmpkg_ci.py
+            scripts/vmpkg_tool.py
+            scripts/verify-image-pair.py
+            scripts/inspect-empty-seed-store.py
+            configs/vmpkg-27.2.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare only the hosted runner and verify source/tool prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          for file in scripts/vmpkg_ci.py scripts/vmpkg_tool.py scripts/verify-image-pair.py \
+                      scripts/inspect-empty-seed-store.py configs/vmpkg-27.2.json; do test -f "$file"; done
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev zstd openssl curl gdisk
+          mkdir -p "$WORK"
+          python3 - <<'PY'
+          import os, shutil
+          free = shutil.disk_usage(os.environ['WORK']).free
+          print('free_physical_bytes', free)
+          if free < 48 * 1024**3:
+              raise SystemExit('Need at least 48 GiB physical free space; no paid/larger runner is selected automatically')
+          PY
+
+      - name: Verify the completed image source and its complete public Release
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/vmpkg_ci.py --work "$WORK" plan --source-run "$SOURCE_RUN"
+
+      - name: Download seven encrypted Release parts in parallel and verify SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/vmpkg_ci.py --work "$WORK" download --parallel 4
+          (cd "$WORK/parts" && sha256sum -c "$WORK/plain/image.tar.zst.enc.sha256")
+
+      - name: Decrypt sparse source images only in ephemeral runner storage
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$ARTIFACT_KEY" ] || { echo '::error::ARTIFACT_KEY is not configured'; exit 1; }
+          cat "$WORK"/parts/image.tar.zst.enc.[0-9][0-9][0-9] \
+            | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ARTIFACT_KEY \
+            | zstd -d -q -c \
+            | tar --sparse --no-same-owner --no-same-permissions -C "$WORK/raw" -xf - -- \
+                boot.img manifest.json kernel.macho.trustcache data-store.img scratch-data.img disk.json
+          python3 scripts/verify-image-pair.py "$WORK/raw" --report "$WORK/private/source-pair-validation.json"
+          python3 scripts/vmpkg_ci.py --work "$WORK" verify-source
+          # All seven source parts have been verified and successfully decrypted.
+          # Reclaim 13.2 GB before creating the second physical disk representation.
+          rm -- "$WORK"/parts/image.tar.zst.enc.[0-9][0-9][0-9]
+
+      - name: Verify the empty seed, overlay CRC and APFS block zero
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/inspect-empty-seed-store.py "$WORK/raw/scratch-data.img" "$WORK/raw/data-store.img" \
+            --layout "$WORK/raw/disk.json" > "$WORK/private/store-preflight.json"
+          python3 scripts/vmpkg_ci.py --work "$WORK" budget --phase convert
+
+      - name: Fetch and verify the original public conversion tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://raw.githubusercontent.com/Droid-VM/macOS-DroidVM/524d27bf57ae92375aa39e3a81e11727c08973ff/research/pcie-data-2026-11-11
+          curl --proto '=https' --proto-redir '=https' --fail --location --retry 4 --silent --show-error "$base/prepare-gpt.py" -o "$WORK/tools/prepare-gpt.py"
+          curl --proto '=https' --proto-redir '=https' --fail --location --retry 4 --silent --show-error "$base/store-to-raw.c" -o "$WORK/tools/store-to-raw.c"
+          printf '%s\n' \
+            '7be0247bf0599ff5034d18d5323d05dd53e96e798dca94cb2ca1e6f528d3a26e  prepare-gpt.py' \
+            '0954eccc80a1ed73077f4ee7900611489758ab482f118d0649994e5289e0b9bd  store-to-raw.c' \
+            > "$WORK/tools/SHA256SUMS"
+          (cd "$WORK/tools" && sha256sum -c SHA256SUMS)
+          gcc -O2 -Wall -Wextra -o "$WORK/tools/store-to-raw" "$WORK/tools/store-to-raw.c"
+
+      - name: Convert with two-pass byte verification and check both GPT copies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$WORK/tools/prepare-gpt.py" "$WORK/raw/scratch-data.img" "$WORK/tools"
+          "$WORK/tools/store-to-raw" "$WORK/raw/data-store.img" "$WORK/raw/data-pcie.img" \
+            "$WORK/tools/data-gpt-prefix.bin" "$WORK/tools/data-gpt-suffix.bin" \
+            | tee "$WORK/private/store-copy.log"
+          sgdisk --verify "$WORK/raw/data-pcie.img" > "$WORK/private/sgdisk-verify.txt"
+          python3 scripts/vmpkg_ci.py --work "$WORK" verify-gpt
+          # GPT wraps the same APFS container; all present source bytes were read
+          # back and compared before the source representation is removed.
+          rm -- "$WORK/raw/data-store.img"
+
+      - name: Bind the reviewed VM profile to actual payload sizes and hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/vmpkg_ci.py --work "$WORK" budget --phase package
+          python3 scripts/vmpkg_ci.py --work "$WORK" manifest --template configs/vmpkg-27.2.json
+
+      - name: Build the real regular-tar ZSTD vmpkg and verify every payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/vmpkg_tool.py pack --manifest "$WORK/private/package-manifest.json" \
+            --file "boot.img=$WORK/raw/boot.img" \
+            --file "data-pcie.img=$WORK/raw/data-pcie.img" \
+            --file "edk2-macos.fd=$WORK/raw/edk2-macos.fd" \
+            --output "$WORK/package/$PACKAGE_NAME" --compression zstd \
+            > "$WORK/private/package-pack.json"
+          python3 scripts/vmpkg_tool.py inspect "$WORK/package/$PACKAGE_NAME" \
+            --verify-payloads --expected-report "$WORK/package/$PACKAGE_NAME.report.json" \
+            > "$WORK/private/package-inspect.json"
+          # This is the real directly-importable package. It contains staged
+          # account state, so only its encrypted transport will be made public.
+          # Drop the 21.8 GB disk before generating the second compressed copy.
+          rm -- "$WORK/raw/data-pcie.img"
+
+      - name: Encrypt only for transport and generate a sanitized public report
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$ARTIFACT_KEY" ] || { echo '::error::ARTIFACT_KEY is not configured'; exit 1; }
+          python3 scripts/vmpkg_ci.py --work "$WORK" budget --phase encrypt
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:ARTIFACT_KEY \
+            -in "$WORK/package/$PACKAGE_NAME" \
+            | split -b 1900m -d -a 3 - "$WORK/dist/$PACKAGE_NAME.enc."
+          # Verify the actual split transport decrypts to the same .vmpkg;
+          # stream into SHA256 instead of allocating another plaintext copy.
+          cat "$WORK"/dist/"$PACKAGE_NAME".enc.[0-9][0-9][0-9] \
+            | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ARTIFACT_KEY \
+            | sha256sum > "$WORK/private/transport-plaintext.sha256"
+          python3 scripts/vmpkg_ci.py --work "$WORK" seal
+          rm -- "$WORK/package/$PACKAGE_NAME"
+
+      - name: Publish only encrypted parts and allowlisted noncredential reports
+        env:
+          SOURCE_NUMBER: ${{ steps.source.outputs.source_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="vmpkg-27.2-$SOURCE_NUMBER"
+          if ! gh release view "$release" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$release" --repo "$GH_REPO" --target "$GITHUB_SHA" --prerelease \
+              --title "macOS 27.2 DroidVM package $SOURCE_NUMBER (encrypted transport)" \
+              --notes 'A real importable .vmpkg is inside the encrypted transport. No plaintext system image or staged account is published. Source provenance, full plaintext SHA256 and package schema checks are in vmpkg-build-report.json.'
+          fi
+          gh release upload "$release" --repo "$GH_REPO" --clobber \
+            "$WORK"/dist/"$PACKAGE_NAME".enc.[0-9][0-9][0-9] \
+            "$WORK/dist/$PACKAGE_NAME.enc.sha256" \
+            "$WORK/dist/$PACKAGE_NAME.sha256" \
+            "$WORK/dist/vmpkg-build-report.json"
+          python3 scripts/vmpkg_ci.py --work "$WORK" audit-published
+          gh release upload "$release" --repo "$GH_REPO" --clobber "$WORK/private/publish-verification.json"
+
+      - name: Upload only small sanitized production proofs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmpkg-production-proofs-${{ inputs.source_run }}
+          path: |
+            ${{ github.workspace }}/vmpkg-work/dist/vmpkg-build-report.json
+            ${{ github.workspace }}/vmpkg-work/dist/macOS-27.2-DroidVM.vmpkg.sha256
+            ${{ github.workspace }}/vmpkg-work/dist/macOS-27.2-DroidVM.vmpkg.enc.sha256
+            ${{ github.workspace }}/vmpkg-work/private/publish-verification.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Remove ephemeral plaintext systems, account state and private manifests
+        if: always()
+        shell: bash
+        run: |
+          rm -rf -- "$WORK/raw" "$WORK/package" "$WORK/private"
