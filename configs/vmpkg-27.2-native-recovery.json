@@ -1,0 +1,232 @@
+{
+  "manifest_version": 1,
+  "format": "vmpkg",
+  "app_version": "0.0.6.r479.g2554f0c8",
+  "app_version_code": 5090,
+  "app_build_type": "debug",
+  "compression": "ZSTD",
+  "vm": {
+    "name": "macOS 27.2 (DroidVM Native Recovery)",
+    "notes": "Keep the packaged NAT network and reference hardware layout. Open SimpleFB for UEFI and early boot; open gpu-0 for the accelerated macOS desktop. COM1 is the primary console. This package has not been verified on the target device.",
+    "backend": "crosvm",
+    "hypervisor": "gunyah",
+    "protected_vm": "pseudo_unprotected",
+    "memory_mb": 5120,
+    "cpu_count": 8,
+    "cpu_affinity": "0=0-7:1=0-7:2=0-7:3=0-7:4=0-7:5=0-7:6=0-7:7=0-7",
+    "cpu_topology_auto": false,
+    "cpu_capacity": "0=792,1=792,2=792,3=792,4=792,5=792,6=1024,7=1024",
+    "cpu_clusters": "0-5;6-7",
+    "cpu_perf_requests": false,
+    "balloon": false,
+    "pmu": true,
+    "rng": true,
+    "smt": true,
+    "sandbox": false,
+    "hugepages": true,
+    "prepare_lend_mthp": "single",
+    "swiotlb_mb": 0,
+    "pci_msi": true,
+    "virtio_transport": "custom",
+    "virtio_mmio": [
+      "gpu",
+      "snd",
+      "media"
+    ],
+    "gpu_backend": "gpu_virglrenderer",
+    "gpu_mode": "native",
+    "gpu_api": "drm2kgsl",
+    "gpu_udmabuf": true,
+    "gpu_drm2kgsl_pool_mb": 64,
+    "gpu_guest_pool_mb": 0,
+    "gpu_guest_prealloc_mb": 0,
+    "gpu_cgroup_enabled": false,
+    "display_blit_provider": "turnip",
+    "vpu_enabled": true,
+    "vpu_codec_enabled": true,
+    "vpu_host_pool_mb": 8,
+    "vpu_guest_pool_mb": 0,
+    "vpu_decoder_backend": "msm_vidc",
+    "vpu_encoder_backend": "mediacodec",
+    "motion_sensor": false,
+    "boot": {
+      "protocol": "uefi",
+      "uefi": {
+        "firmware": "",
+        "vars_enabled": false,
+        "vars": ""
+      }
+    },
+    "screens": {
+      "gpu-0": {
+        "enabled": true,
+        "exporter": "native",
+        "transport_cap": "gpu",
+        "input_enabled": true,
+        "width": 1920,
+        "height": 1080,
+        "refresh_rate": 120,
+        "dpi_h": 160,
+        "dpi_v": 160
+      },
+      "simplefb": {
+        "enabled": true,
+        "exporter": "native",
+        "transport_cap": "cpu",
+        "input_enabled": false,
+        "width": 1920,
+        "height": 1080,
+        "poll_hz": 30
+      }
+    },
+    "peripherals": [
+      {
+        "type": "virtio_sound",
+        "buffer": "normal",
+        "underrun": "silence",
+        "endpoints": [
+          {
+            "mode": "speaker",
+            "host_device": "DEFAULT|system default",
+            "host_label": ""
+          },
+          {
+            "mode": "microphone",
+            "host_device": "DEFAULT|system default",
+            "host_label": ""
+          }
+        ]
+      },
+      {
+        "type": "xhci_usb",
+        "id": "xhci-0",
+        "usb2_ports": 8,
+        "usb3_ports": 8
+      }
+    ],
+    "xhci_next": 1,
+    "serial_ports": [
+      {
+        "hardware": "serial",
+        "num": 1,
+        "backend": "app_console",
+        "console": true,
+        "fixed": true
+      },
+      {
+        "hardware": "serial",
+        "num": 2,
+        "backend": "sink",
+        "console": false,
+        "fixed": true
+      },
+      {
+        "hardware": "serial",
+        "num": 3,
+        "backend": "sink",
+        "console": false,
+        "fixed": true
+      },
+      {
+        "hardware": "serial",
+        "num": 4,
+        "backend": "sink",
+        "console": false,
+        "fixed": true
+      },
+      {
+        "hardware": "sbsa",
+        "num": 1,
+        "backend": "app_console",
+        "console": false
+      }
+    ],
+    "networks": [
+      {
+        "pkg_network_ref": "net0",
+        "mac_address": "02:44:56:4d:00:01"
+      }
+    ],
+    "shared_dirs": [],
+    "extra_options": [],
+    "environment_variables": [],
+    "strace": false,
+    "auto_up": false
+  },
+  "disks": [
+    {
+      "index": 0,
+      "path": "",
+      "name": "boot.img",
+      "archive_path": "boot.img",
+      "readonly": false,
+      "bus": "virtio",
+      "format": "raw",
+      "attached": true,
+      "size": 0
+    },
+    {
+      "index": 1,
+      "path": "",
+      "name": "data-pcie.img",
+      "archive_path": "data-pcie.img",
+      "readonly": false,
+      "bus": "virtio",
+      "format": "raw",
+      "attached": true,
+      "size": 0
+    }
+  ],
+  "boots": [
+    {
+      "path": "",
+      "name": "edk2-macos.fd",
+      "archive_path": "edk2-macos.fd",
+      "kind": "uefi",
+      "size": 0
+    }
+  ],
+  "networks": [
+    {
+      "schema": 2,
+      "pkg_network_ref": "net0",
+      "name": "macOS NAT",
+      "bridge_name": "brmacos",
+      "bridge_type": "gvisor",
+      "uplink_mode": "l3",
+      "stp": false,
+      "auto_up": false,
+      "l2": {},
+      "l3": {
+        "vlans": [
+          {
+            "vlan_id": 0,
+            "ipv4": {
+              "cidr": "10.203.27.1/24",
+              "snat": true,
+              "dhcp": {
+                "enabled": true,
+                "offset_start": 128,
+                "offset_end": 192
+              }
+            },
+            "ipv6": {
+              "source": "static",
+              "cidr": null,
+              "snat": false,
+              "dhcp": {
+                "enabled": false
+              },
+              "slaac": {
+                "enabled": false
+              }
+            },
+            "dns_servers": [],
+            "ipv4_secondary": [],
+            "ipv6_secondary": []
+          }
+        ]
+      }
+    }
+  ]
+}

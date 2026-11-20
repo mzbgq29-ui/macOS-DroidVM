@@ -8,6 +8,10 @@ on:
         type: string
         required: true
         default: '44723953351'
+      candidate_commit:
+        description: Exact recovery image commit; leave blank for the legacy package
+        type: string
+        required: false
 
 permissions:
   contents: write
@@ -25,6 +29,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       SOURCE_RUN: ${{ inputs.source_run }}
+      VMPKG_CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
       WORK: ${{ github.workspace }}/vmpkg-work
       PACKAGE_NAME: macOS-27.2-DroidVM.vmpkg
     steps:
@@ -39,6 +44,7 @@ jobs:
             scripts/verify-image-pair.py
             scripts/inspect-empty-seed-store.py
             configs/vmpkg-27.2.json
+            configs/vmpkg-27.2-native-recovery.json
           sparse-checkout-cone-mode: false
 
       - name: Prepare only the hosted runner and verify source/tool prerequisites
@@ -47,8 +53,12 @@ jobs:
           set -euo pipefail
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$RUNNER_OS" = Linux
+          if [ -n "$VMPKG_CANDIDATE_COMMIT" ]; then
+            test "$GITHUB_REF_NAME" = redmi-native-recovery
+          fi
           for file in scripts/vmpkg_ci.py scripts/vmpkg_tool.py scripts/verify-image-pair.py \
-                      scripts/inspect-empty-seed-store.py configs/vmpkg-27.2.json; do test -f "$file"; done
+                      scripts/inspect-empty-seed-store.py configs/vmpkg-27.2.json \
+                      configs/vmpkg-27.2-native-recovery.json; do test -f "$file"; done
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           sudo apt-get update -qq
@@ -69,7 +79,7 @@ jobs:
           set -euo pipefail
           python3 scripts/vmpkg_ci.py --work "$WORK" plan --source-run "$SOURCE_RUN"
 
-      - name: Download seven encrypted Release parts in parallel and verify SHA256
+      - name: Download encrypted Release parts in parallel and verify SHA256
         shell: bash
         run: |
           set -euo pipefail
@@ -90,8 +100,7 @@ jobs:
                 boot.img manifest.json kernel.macho.trustcache data-store.img scratch-data.img disk.json
           python3 scripts/verify-image-pair.py "$WORK/raw" --report "$WORK/private/source-pair-validation.json"
           python3 scripts/vmpkg_ci.py --work "$WORK" verify-source
-          # All seven source parts have been verified and successfully decrypted.
-          # Reclaim 13.2 GB before creating the second physical disk representation.
+          # Reclaim the verified encrypted parts before converting the disk.
           rm -- "$WORK"/parts/image.tar.zst.enc.[0-9][0-9][0-9]
 
       - name: Verify the empty seed, overlay CRC and APFS block zero
@@ -135,7 +144,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/vmpkg_ci.py --work "$WORK" budget --phase package
-          python3 scripts/vmpkg_ci.py --work "$WORK" manifest --template configs/vmpkg-27.2.json
+          template=configs/vmpkg-27.2.json
+          if [ -n "$VMPKG_CANDIDATE_COMMIT" ]; then
+            template=configs/vmpkg-27.2-native-recovery.json
+          fi
+          python3 scripts/vmpkg_ci.py --work "$WORK" manifest --template "$template"
 
       - name: Build the real regular-tar ZSTD vmpkg and verify every payload
         shell: bash
@@ -150,12 +163,53 @@ jobs:
           python3 scripts/vmpkg_tool.py inspect "$WORK/package/$PACKAGE_NAME" \
             --verify-payloads --expected-report "$WORK/package/$PACKAGE_NAME.report.json" \
             > "$WORK/private/package-inspect.json"
-          # This is the real directly-importable package. It contains staged
-          # account state, so only its encrypted transport will be made public.
-          # Drop the 21.8 GB disk before generating the second compressed copy.
           rm -- "$WORK/raw/data-pcie.img"
 
+      - name: Name the recovery candidate after full payload verification
+        if: inputs.candidate_commit != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv -- "$WORK/package/$PACKAGE_NAME" "$WORK/package/macOS-27.2-DroidVM-Native-Recovery.vmpkg"
+
+      - name: Upload the recovery candidate as a single original vmpkg
+        if: inputs.candidate_commit != ''
+        id: recovery_artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          path: ${{ github.workspace }}/vmpkg-work/package/macOS-27.2-DroidVM-Native-Recovery.vmpkg
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify the uploaded candidate and record the download
+        if: inputs.candidate_commit != ''
+        env:
+          ARTIFACT_URL: ${{ steps.recovery_artifact.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.recovery_artifact.outputs.artifact-digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['WORK'])
+          inspected = json.loads((root / 'private/package-inspect.json').read_text())
+          source = json.loads((root / 'private/source-verified.json').read_text())
+          assert inspected['status'] == 'payloads_verified_not_device_tested'
+          assert source['candidate_commit'] == os.environ['VMPKG_CANDIDATE_COMMIT']
+          sha = inspected['package_sha256']
+          assert os.environ['ARTIFACT_DIGEST'].removeprefix('sha256:') == sha
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"Download: [macOS-27.2-DroidVM-Native-Recovery.vmpkg]({os.environ['ARTIFACT_URL']})\n\n")
+              summary.write(f"Source run: {source['source_run']} ({source['candidate_commit']})\n\n")
+              summary.write(f"Bytes: {inspected['package_bytes']}\n\nSHA-256: `{sha}`\n\n")
+              summary.write("GitHub sign-in required. Device boot and GPU execution are not verified by this build.\n")
+          print(f"Verified uploaded SHA-256: {sha}")
+          PY
+
       - name: Encrypt only for transport and generate a sanitized public report
+        if: inputs.candidate_commit == ''
         env:
           ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
         shell: bash
@@ -175,6 +229,7 @@ jobs:
           rm -- "$WORK/package/$PACKAGE_NAME"
 
       - name: Publish only encrypted parts and allowlisted noncredential reports
+        if: inputs.candidate_commit == ''
         env:
           SOURCE_NUMBER: ${{ steps.source.outputs.source_number }}
         shell: bash
@@ -195,7 +250,7 @@ jobs:
           gh release upload "$release" --repo "$GH_REPO" --clobber "$WORK/private/publish-verification.json"
 
       - name: Upload only small sanitized production proofs
-        if: always()
+        if: always() && inputs.candidate_commit == ''
         uses: actions/upload-artifact@v4
         with:
           name: vmpkg-production-proofs-${{ inputs.source_run }}
@@ -211,4 +266,4 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf -- "$WORK/raw" "$WORK/package" "$WORK/private"
+          rm -rf -- "$WORK"

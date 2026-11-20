@@ -24,6 +24,8 @@ MIB, GIB = 1024**2, 1024**3
 NAME = 'macOS-27.2-DroidVM.vmpkg'
 SOURCE_SHA = '524d27bf57ae92375aa39e3a81e11727c08973ff'
 SOURCE_RUN = 44723953351
+CANDIDATE_BRANCH = 'redmi-native-recovery'
+FIRMWARE_TAG = 'image-27.2-1'
 FIRMWARE_SHA = 'ab69e017d2965d73ed2057bed8922a3908639021984bf250ec530cb6cb60cc4d'
 SOURCE_PART_SHAS = (
     '89883242882374d5169c18029f972b14be93027d72f161e1e66acd3e156d591e',
@@ -96,54 +98,127 @@ def curl_asset(asset, path):
     print(f'verified {path.name}: {path.stat().st_size} bytes', flush=True)
 
 
-def plan(root, source_run):
+def release_assets(repo, tag):
+    release = gh(f'repos/{repo}/releases/tags/{tag}')
+    assets = {a['name']: a for a in release['assets']}
+    require(len(assets) == len(release['assets']), 'duplicate source release asset names')
+    return release, assets
+
+
+def checked_asset(assets, repo, tag, name):
+    require(name in assets and assets[name]['state'] == 'uploaded', f'missing source asset: {name}')
+    asset = assets[name]
+    require(re.fullmatch(r'sha256:[0-9a-f]{64}', asset.get('digest') or ''), f'missing server digest: {name}')
+    checked_url(repo, tag, name, asset['browser_download_url'])
+    return asset
+
+
+def candidate_metadata(root, source, repo, tag, assets):
+    expected = tag + '-plain'
+    endpoint = f"repos/{repo}/actions/runs/{source['id']}/artifacts"
+    items = gh(f'{endpoint}?name={expected}')['artifacts']
+    matches = [a for a in items if a['name'] == expected and a['expired'] is False]
+    require(len(matches) == 1, f'expected one live Actions artifact: {expected}')
+    artifact = matches[0]
+    require(type(artifact['size_in_bytes']) is int and 0 < artifact['size_in_bytes'] <= MIB,
+            'candidate metadata artifact exceeds its size limit')
+    out = root / 'private/source-artifact'
+    out.mkdir()
+    subprocess.run(['gh', 'run', 'download', str(source['id']), '--repo', repo, '--name', expected,
+                    '--dir', str(out)], check=True)
+    metadata_shas = {}
+    for name in PLAIN_INPUTS:
+        path = regular(out / name)
+        asset = checked_asset(assets, repo, tag, name)
+        digest = sha(path)
+        require(0 < path.stat().st_size <= MIB and asset['size'] == path.stat().st_size
+                and asset['digest'] == f'sha256:{digest}', f'Actions artifact/Release mismatch: {name}')
+        shutil.copyfile(path, root / 'plain' / name)
+        if name in SOURCE_METADATA_SHAS:
+            metadata_shas[name] = digest
+    return metadata_shas, artifact['id']
+
+
+def plan(root, source_run, candidate_commit=''):
     require(re.fullmatch(r'[0-9]+', source_run), 'source_run must be ASCII digits')
-    require(int(source_run) == SOURCE_RUN, 'source run is outside this reviewed image pairing')
+    if candidate_commit:
+        require(re.fullmatch(r'[0-9a-f]{40}', candidate_commit), 'candidate commit must be a full lowercase Git SHA')
+    else:
+        require(int(source_run) == SOURCE_RUN, 'source run is outside this reviewed image pairing')
     repo = os.environ['GH_REPO']
     source = gh(f'repos/{repo}/actions/runs/{source_run}')
     require(source['id'] == int(source_run), 'source run ID mismatch')
     require(source['repository']['full_name'] == repo and source['head_repository']['full_name'] == repo, 'source repository mismatch')
     require(source['path'] == '.github/workflows/image.yml' and source['event'] == 'workflow_dispatch', 'source workflow/event mismatch')
-    # This source run failed only during duplicate release upload; its image
-    # build and independently recovered/decrypted image pairing were reviewed.
-    require(source['status'] == 'completed' and source['head_sha'] == SOURCE_SHA, 'unreviewed or incomplete source run')
+    require(source['status'] == 'completed' and source['head_sha'] == (candidate_commit or SOURCE_SHA),
+            'unreviewed or incomplete source run')
+    if candidate_commit:
+        require(source['head_branch'] == CANDIDATE_BRANCH and source['conclusion'] == 'success',
+                'candidate requires a successful recovery branch image run')
+    # The legacy source failed only at duplicate release upload; its separately
+    # recovered parts and decrypted metadata remain pinned below.
     number = source['run_number']
     require(type(number) is int and number > 0, 'bad source run number')
     tag = f'image-27.2-{number}'
-    release = gh(f'repos/{repo}/releases/tags/{tag}')
-    require(len({a['name'] for a in release['assets']}) == len(release['assets']), 'duplicate source release asset names')
-    assets = {a['name']: a for a in release['assets']}
+    release, assets = release_assets(repo, tag)
     for folder in ('parts', 'plain', 'raw', 'private', 'tools', 'package', 'dist'):
         (root / folder).mkdir(parents=True, exist_ok=True)
-    names = [*PLAIN_INPUTS, 'edk2-macos.fd', *(f'image.tar.zst.enc.{i:03d}' for i in range(7))]
-    for name in names:
-        require(name in assets and assets[name]['state'] == 'uploaded', f'missing source asset: {name}')
-        a = assets[name]
-        require(re.fullmatch(r'sha256:[0-9a-f]{64}', a.get('digest', '')), f'missing server digest: {name}')
-        checked_url(repo, tag, name, a['browser_download_url'])
-    for name in PLAIN_INPUTS:
-        curl_asset(assets[name], root / 'plain' / name)
-        if name in SOURCE_METADATA_SHAS:
-            require(sha(root / 'plain' / name) == SOURCE_METADATA_SHAS[name], f'unreviewed source metadata: {name}')
-    require(assets['edk2-macos.fd']['digest'] == 'sha256:' + FIRMWARE_SHA and assets['edk2-macos.fd']['size'] == 4194304,
-            'unreviewed macOS firmware')
-    curl_asset(assets['edk2-macos.fd'], root / 'raw/edk2-macos.fd')
+    if candidate_commit:
+        metadata_shas, artifact_id = candidate_metadata(root, source, repo, tag, assets)
+        _, firmware_assets = release_assets(repo, FIRMWARE_TAG)
+    else:
+        metadata_shas, firmware_assets = SOURCE_METADATA_SHAS, assets
+        for name in PLAIN_INPUTS:
+            curl_asset(checked_asset(assets, repo, tag, name), root / 'plain' / name)
+            if name in metadata_shas:
+                require(sha(root / 'plain' / name) == metadata_shas[name], f'unreviewed source metadata: {name}')
+    firmware = checked_asset(firmware_assets, repo, FIRMWARE_TAG if candidate_commit else tag, 'edk2-macos.fd')
+    require(firmware['digest'] == 'sha256:' + FIRMWARE_SHA and firmware['size'] == 4194304, 'unreviewed macOS firmware')
+    curl_asset(firmware, root / 'raw/edk2-macos.fd')
     manifest, layout = read(root / 'plain/manifest.json'), read(root / 'plain/disk.json')
     require(manifest['commit'] == source['head_sha'] and manifest['dirty'] is False, 'source manifest commit/dirty mismatch')
     require(manifest['product'] == 'k27' and manifest['tag'] == manifest['env']['MACOS_TAG'] == layout['tag'] == '27.2', 'wrong image product')
+    if candidate_commit:
+        require(layout['seed'] == 'scratch-data.img' and layout['store'] == 'data-store.img',
+                'unexpected candidate disk layout files')
+        require(type(layout['bytes']) is int and 2 * GIB < layout['bytes'] and layout['bytes'] % 4096 == 0
+                and type(layout['window_offset']) is int and layout['window_offset'] > 0
+                and layout['window_offset'] % 4096 == 0, 'invalid candidate disk layout geometry')
+        require(str(uuid.UUID(layout['system']['uuid'])) == layout['system']['uuid'].lower(),
+                'noncanonical candidate root UUID')
     rows = []
     for line in (root / 'plain/image.tar.zst.enc.sha256').read_text().splitlines():
         m = re.fullmatch(r'([0-9a-f]{64})  (image\.tar\.zst\.enc\.[0-9]{3})', line)
         require(m is not None, 'bad source checksum row')
         rows.append((m[2], m[1]))
-    require([n for n, _ in rows] == [f'image.tar.zst.enc.{i:03d}' for i in range(7)], 'need all seven source parts in order')
-    require(tuple(digest for _, digest in rows) == SOURCE_PART_SHAS, 'source parts differ from reviewed image pairing')
-    for name, digest in rows:
-        require(assets[name]['digest'] == 'sha256:' + digest, f'server/source digest mismatch: {name}')
+    names = [name for name, _ in rows]
+    if candidate_commit:
+        require(1 <= len(names) <= 16 and names == [f'image.tar.zst.enc.{i:03d}' for i in range(len(names))],
+                'candidate source parts are missing, repeated or out of order')
+        require(set(names) == {n for n in assets if n.startswith('image.tar.zst.enc.') and n not in PLAIN_INPUTS},
+                'candidate Release contains missing or unexpected source parts')
+    else:
+        require(names == [f'image.tar.zst.enc.{i:03d}' for i in range(7)], 'need all seven source parts in order')
+        require(tuple(digest for _, digest in rows) == SOURCE_PART_SHAS, 'source parts differ from reviewed image pairing')
+    for index, (name, digest) in enumerate(rows):
+        asset = checked_asset(assets, repo, tag, name)
+        require(asset['digest'] == 'sha256:' + digest, f'server/source digest mismatch: {name}')
+        if candidate_commit:
+            size = asset['size']
+            require(type(size) is int and 0 < size <= 1900 * MIB and size % 16 == 0
+                    and (index == len(rows) - 1 or size == 1900 * MIB), f'invalid encrypted part size: {name}')
+    if candidate_commit:
+        total = sum(assets[name]['size'] for name in names)
+        require(total >= 32 and total <= shutil.disk_usage(root).free - 2 * GIB, 'candidate source parts exceed available disk')
     summary = {k: source[k] for k in ('id', 'run_number', 'head_sha', 'path', 'event', 'status', 'conclusion', 'html_url', 'created_at')}
     summary['repository'] = repo
-    write(root / 'private/source-plan.json', {'source_run': summary, 'source_release': release['html_url'],
-                                             'assets': {n: assets[n] for n in names}})
+    source_plan = {'source_run': summary, 'source_release': release['html_url'], 'parts': names,
+                   'assets': {**{n: assets[n] for n in [*PLAIN_INPUTS, *names]}, 'edk2-macos.fd': firmware}}
+    if candidate_commit:
+        summary['head_branch'] = source['head_branch']
+        source_plan.update(candidate_commit=candidate_commit, source_metadata_shas=metadata_shas,
+                           source_metadata_artifact_id=artifact_id)
+    write(root / 'private/source-plan.json', source_plan)
     if os.environ.get('GITHUB_OUTPUT'):
         with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
             out.write(f'source_number={number}\n')
@@ -153,7 +228,8 @@ def plan(root, source_run):
 def download(root, parallel):
     plan = read(root / 'private/source-plan.json')
     assets = plan['assets']
-    names = [f'image.tar.zst.enc.{i:03d}' for i in range(7)]
+    names = plan.get('parts', [f'image.tar.zst.enc.{i:03d}' for i in range(7)])
+    require(names and names == [f'image.tar.zst.enc.{i:03d}' for i in range(len(names))], 'invalid planned part sequence')
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         jobs = {pool.submit(curl_asset, assets[name], root / 'parts' / name): name for name in names}
         for job in as_completed(jobs):
@@ -168,17 +244,32 @@ def verify_source(root):
     require({p.name for p in (root / 'raw').iterdir()} == expected, 'unexpected decrypted source payload set')
     for name in expected:
         regular(root / 'raw' / name)
-    for name, digest in SOURCE_METADATA_SHAS.items():
+    plan_path = root / 'private/source-plan.json'
+    source_plan = read(plan_path) if plan_path.is_file() else {}
+    candidate = source_plan.get('candidate_commit')
+    metadata_shas = source_plan['source_metadata_shas'] if candidate else SOURCE_METADATA_SHAS
+    require(set(metadata_shas) == set(SOURCE_METADATA_SHAS), 'invalid source metadata identity set')
+    for name, digest in metadata_shas.items():
         require(sha(root / 'raw' / name) == digest == sha(root / 'plain' / name),
                 f'decrypted/public metadata mismatch: {name}')
     require(sha(root / 'raw/edk2-macos.fd') == FIRMWARE_SHA, 'firmware changed after download')
     pair = read(root / 'private/source-pair-validation.json')
-    require(pair['passed'] is True and pair['commit'] == SOURCE_SHA and pair['tag'] == '27.2'
+    require(pair['passed'] is True and pair['commit'] == (candidate or SOURCE_SHA) and pair['tag'] == '27.2'
             and pair['dirty'] is False and pair['device_boot_tested'] is False, 'unverified image pairing')
-    require(pair['store_logical_bytes'] == 51541188608, 'unexpected source store length')
-    proof = {'passed': True, 'source_run': SOURCE_RUN, 'source_metadata_pinned_and_matched': True,
+    if candidate:
+        layout = read(root / 'raw/disk.json')
+        require(pair['root_uuid'] == layout['system']['uuid'] and pair['store_logical_bytes']
+                == layout['bytes'] + layout['window_offset'] == (root / 'raw/data-store.img').stat().st_size,
+                'candidate root UUID/store length mismatch')
+    else:
+        require(pair['store_logical_bytes'] == 51541188608, 'unexpected source store length')
+    run = source_plan['source_run']['id'] if candidate else SOURCE_RUN
+    proof = {'passed': True, 'source_run': run, 'source_metadata_pinned_and_matched': True,
              'decrypted_payloads_regular': True, 'static_source_pairing_passed': True,
              'device_boot_tested': False, 'performance_tested': False}
+    if candidate:
+        proof.update(candidate_commit=candidate, source_metadata_artifact_id=source_plan['source_metadata_artifact_id'],
+                     source_metadata_shas=metadata_shas)
     write(root / 'private/source-verified.json', proof)
     print(json.dumps(proof, indent=2))
 
@@ -334,6 +425,8 @@ def main():
     parser.add_argument('--work', type=Path, required=True)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('plan'); p.add_argument('--source-run', required=True)
+    p.add_argument('--candidate-commit', default=os.environ.get('VMPKG_CANDIDATE_COMMIT', ''),
+                   help='full source commit for a successful recovery branch image run')
     p = sub.add_parser('download'); p.add_argument('--parallel', type=int, choices=(1, 2, 3, 4), default=4)
     sub.add_parser('verify-source')
     p = sub.add_parser('budget'); p.add_argument('--phase', choices=('convert', 'package', 'encrypt'), required=True)
@@ -342,7 +435,7 @@ def main():
     sub.add_parser('seal')
     sub.add_parser('audit-published')
     args = parser.parse_args(); root = args.work.resolve(); root.mkdir(parents=True, exist_ok=True)
-    if args.command == 'plan': plan(root, args.source_run)
+    if args.command == 'plan': plan(root, args.source_run, args.candidate_commit)
     elif args.command == 'download': download(root, args.parallel)
     elif args.command == 'verify-source': verify_source(root)
     elif args.command == 'budget': budget(root, args.phase)
