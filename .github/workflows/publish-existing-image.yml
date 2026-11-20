@@ -1,0 +1,172 @@
+name: Publish an existing verified image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Completed image workflow run in this repository
+        type: string
+        required: true
+        default: '44723953351'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-existing-image-${{ inputs.source_run }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_RUN: ${{ inputs.source_run }}
+      RECOVERY: ${{ github.workspace }}/image-recovery
+    steps:
+      - name: Validate the source run and prepare disk space
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, shutil, subprocess
+          from pathlib import Path
+          run = os.environ['SOURCE_RUN']
+          if not re.fullmatch(r'[0-9]+', run):
+              raise SystemExit('source_run must contain ASCII digits only')
+          repo = os.environ['GH_REPO']
+          source = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run}'], text=True))
+          assert source['repository']['full_name'] == repo, 'source repository mismatch'
+          assert source['head_repository']['full_name'] == repo, 'source head repository mismatch'
+          assert source['path'] == '.github/workflows/image.yml', 'source is not image.yml'
+          assert source['event'] == 'workflow_dispatch', 'source was not manually dispatched'
+          assert source['status'] == 'completed', 'source has not completed'
+          assert str(source['id']) == str(int(run)), 'source run ID mismatch'
+          assert isinstance(source['run_number'], int) and source['run_number'] > 0, 'invalid source run number'
+          assert re.fullmatch(r'[0-9a-f]{40}', source['head_sha']), 'invalid source commit'
+          root = Path(os.environ['RECOVERY'])
+          root.mkdir(parents=True, exist_ok=True)
+          # Reserve room for both the 13.2 GB ZIP and its encrypted parts.
+          # Only remove known runner preinstalls when needed, never workspace data.
+          if shutil.disk_usage(root).free < 32 * 1024**3:
+              subprocess.run(['sudo', 'rm', '-rf', '/usr/share/dotnet', '/usr/local/lib/android', '/opt/ghc',
+                              '/usr/local/.ghcup', '/opt/hostedtoolcache/CodeQL', '/usr/local/share/boost'], check=True)
+          assert shutil.disk_usage(root).free >= 32 * 1024**3, 'need at least 32 GiB free'
+          summary = {k: source[k] for k in ('id', 'run_number', 'head_sha', 'path', 'event', 'status', 'conclusion', 'html_url')}
+          summary['repository'] = repo
+          (root / 'source-run.json').write_text(json.dumps(summary, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"run_number={source['run_number']}\n")
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Download the complete encrypted image and its plain manifest
+        shell: bash
+        env:
+          SOURCE_NUMBER: ${{ steps.source.outputs.run_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RECOVERY/parts" "$RECOVERY/plain"
+          gh run download "$SOURCE_RUN" --repo "$GH_REPO" \
+            --name "image-27.2-$SOURCE_NUMBER" --dir "$RECOVERY/parts"
+          gh run download "$SOURCE_RUN" --repo "$GH_REPO" \
+            --name "image-27.2-$SOURCE_NUMBER-plain" --dir "$RECOVERY/plain"
+
+      - name: Validate provenance and all seven encrypted part hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RECOVERY'])
+          source = json.loads((root / 'source-run.json').read_text())
+          manifest = json.loads((root / 'plain/manifest.json').read_text())
+          layout = json.loads((root / 'plain/disk.json').read_text())
+          assert manifest['commit'] == source['head_sha'], 'artifact commit differs from source run'
+          assert manifest['product'] == 'k27', 'unexpected product'
+          assert manifest['tag'] == '27.2', 'unexpected manifest tag'
+          assert manifest['env']['MACOS_TAG'] == '27.2', 'unexpected product environment tag'
+          assert manifest['dirty'] is False, 'source tree was dirty'
+          assert layout['tag'] == '27.2', 'unexpected disk tag'
+          expected = [f'image.tar.zst.enc.{i:03d}' for i in range(7)]
+          lines = (root / 'plain/image.tar.zst.enc.sha256').read_text().splitlines()
+          rows = []
+          for line in lines:
+              match = re.fullmatch(r'([0-9a-f]{64})  (image\.tar\.zst\.enc\.[0-9]{3})', line)
+              assert match, 'invalid checksum-list row'
+              rows.append({'sha256': match[1], 'name': match[2]})
+          assert [row['name'] for row in rows] == expected, 'expected exactly .000 through .006, in order'
+          actual = sorted(p.name for p in (root / 'parts').iterdir())
+          assert actual == expected, 'missing or unexpected encrypted parts'
+          plain = ['disk.json', 'image.tar.zst.enc.sha256', 'manifest.json', 'provenance.json', 'sha256.txt']
+          assert sorted(p.name for p in (root / 'plain').iterdir()) == plain, 'unexpected plain companion contents'
+          for path in [*(root / 'parts').iterdir(), *(root / 'plain').iterdir()]:
+              assert path.is_file() and not path.is_symlink(), 'expected ordinary artifact files'
+          report = {'source_run': source, 'artifact': f"image-27.2-{source['run_number']}",
+                    'source_commit_matches_manifest': True, 'product': manifest['product'], 'tag': manifest['tag'],
+                    'encrypted_parts': [{**row, 'bytes': (root / 'parts' / row['name']).stat().st_size} for row in rows],
+                    'decrypted': False, 'hardware_boot_tested': False, 'sha256_verified': False}
+          (root / 'repair-report.json').write_text(json.dumps(report, indent=2) + '\n')
+          PY
+          (cd "$RECOVERY/parts" && sha256sum -c "$RECOVERY/plain/image.tar.zst.enc.sha256")
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RECOVERY']) / 'repair-report.json'
+          report = json.loads(path.read_text())
+          report['sha256_verified'] = True
+          path.write_text(json.dumps(report, indent=2) + '\n')
+          PY
+
+      - name: Publish only verified controlled files without duplicate names
+        shell: bash
+        env:
+          SOURCE_NUMBER: ${{ steps.source.outputs.run_number }}
+        run: |
+          set -euo pipefail
+          release="image-27.2-$SOURCE_NUMBER"
+          if ! gh release view "$release" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$release" --repo "$GH_REPO" --prerelease \
+              --title "k27 27.2 image $SOURCE_NUMBER (encrypted)" \
+              --notes "Verified encrypted image artifacts from source workflow run $SOURCE_RUN. No rebuild or decryption."
+          fi
+          gh release upload "$release" --repo "$GH_REPO" --clobber \
+            "$RECOVERY"/parts/image.tar.zst.enc.[0-9][0-9][0-9] \
+            "$RECOVERY/plain/disk.json" \
+            "$RECOVERY/plain/image.tar.zst.enc.sha256" \
+            "$RECOVERY/plain/manifest.json" \
+            "$RECOVERY/plain/provenance.json" \
+            "$RECOVERY/plain/sha256.txt"
+          RELEASE="$release" python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RECOVERY'])
+          release = json.loads(subprocess.check_output(['gh', 'release', 'view', os.environ['RELEASE'], '--repo', os.environ['GH_REPO'],
+                                                        '--json', 'url,assets'], text=True))
+          assets = {a['name']: a for a in release['assets']}
+          expected = [*(root / 'parts').iterdir(), *(root / 'plain').iterdir()]
+          for path in expected:
+              assert path.name in assets, f'missing published asset: {path.name}'
+              assert assets[path.name]['state'] == 'uploaded', f'asset upload incomplete: {path.name}'
+              assert assets[path.name]['size'] == path.stat().st_size, f'published asset size mismatch: {path.name}'
+          report_path = root / 'repair-report.json'
+          report = json.loads(report_path.read_text())
+          report['release_url'] = release['url']
+          report['all_controlled_assets_published'] = True
+          report_path.write_text(json.dumps(report, indent=2) + '\n')
+          print(release['url'])
+          PY
+
+      - name: Upload the provenance and checksum repair report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-release-repair-${{ inputs.source_run }}
+          path: ${{ github.workspace }}/image-recovery/repair-report.json
+          if-no-files-found: ignore
+          retention-days: 30
