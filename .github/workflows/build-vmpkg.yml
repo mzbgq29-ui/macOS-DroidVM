@@ -32,6 +32,7 @@ jobs:
       VMPKG_CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
       WORK: ${{ github.workspace }}/vmpkg-work
       PACKAGE_NAME: macOS-27.2-DroidVM.vmpkg
+      RECOVERY_PACKAGE_NAME: macOS-27.2-DroidVM-Native-Recovery-2.vmpkg
     steps:
       - name: Check out reviewed host tools and portable VM manifest
         uses: actions/checkout@v4
@@ -170,14 +171,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mv -- "$WORK/package/$PACKAGE_NAME" "$WORK/package/macOS-27.2-DroidVM-Native-Recovery.vmpkg"
+          mv -- "$WORK/package/$PACKAGE_NAME" "$WORK/package/$RECOVERY_PACKAGE_NAME"
 
       - name: Upload the recovery candidate as a single original vmpkg
         if: inputs.candidate_commit != ''
         id: recovery_artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          path: ${{ github.workspace }}/vmpkg-work/package/macOS-27.2-DroidVM-Native-Recovery.vmpkg
+          path: ${{ env.WORK }}/package/${{ env.RECOVERY_PACKAGE_NAME }}
           archive: false
           if-no-files-found: error
           retention-days: 7
@@ -201,7 +202,7 @@ jobs:
           sha = inspected['package_sha256']
           assert os.environ['ARTIFACT_DIGEST'].removeprefix('sha256:') == sha
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write(f"Download: [macOS-27.2-DroidVM-Native-Recovery.vmpkg]({os.environ['ARTIFACT_URL']})\n\n")
+              summary.write(f"Download: [{os.environ['RECOVERY_PACKAGE_NAME']}]({os.environ['ARTIFACT_URL']})\n\n")
               summary.write(f"Source run: {source['source_run']} ({source['candidate_commit']})\n\n")
               summary.write(f"Bytes: {inspected['package_bytes']}\n\nSHA-256: `{sha}`\n\n")
               summary.write("GitHub sign-in required. Device boot and GPU execution are not verified by this build.\n")

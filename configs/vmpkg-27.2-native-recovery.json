@@ -6,8 +6,8 @@
   "app_build_type": "debug",
   "compression": "ZSTD",
   "vm": {
-    "name": "macOS 27.2 (DroidVM Native Recovery)",
-    "notes": "Keep the packaged NAT network and reference hardware layout. Open SimpleFB for UEFI and early boot; open gpu-0 for the accelerated macOS desktop. COM1 is the primary console. This package has not been verified on the target device.",
+    "name": "macOS 27.2 (DroidVM Native Recovery 2)",
+    "notes": "Open the native GPU screen for both startup and the macOS desktop. SimpleFB stays enabled for firmware and early boot, which crosvm mirrors into the GPU screen until the guest takes over. Keep the packaged NAT network and hardware layout. COM1 is the primary console. Device boot and acceleration are not verified by CI.",
     "backend": "crosvm",
     "hypervisor": "gunyah",
     "protected_vm": "pseudo_unprotected",
@@ -24,7 +24,7 @@
     "smt": true,
     "sandbox": false,
     "hugepages": true,
-    "prepare_lend_mthp": "single",
+    "prepare_lend_mthp": "chunked",
     "swiotlb_mb": 0,
     "pci_msi": true,
     "virtio_transport": "custom",
@@ -71,7 +71,7 @@
       },
       "simplefb": {
         "enabled": true,
-        "exporter": "native",
+        "exporter": "none",
         "transport_cap": "cpu",
         "input_enabled": false,
         "width": 1920,
