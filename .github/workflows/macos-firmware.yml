@@ -1,0 +1,96 @@
+name: macOS firmware (no UEFI virtio GPU)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the pinned public macOS firmware source
+        uses: actions/checkout@v4
+        with:
+          repository: Droid-VM/edk2-gunyah
+          ref: ee11a290dc1207270c53eb73f97a9bef92b8e97b
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install native ARM64 build dependencies
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential acpica-tools uuid-dev nasm python3 git
+
+      - name: Verify source pins
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = ee11a290dc1207270c53eb73f97a9bef92b8e97b
+          test "$(git -C edk2 rev-parse HEAD)" = b7a715f7c03c45c6b4575bf88596bfd79658b8ce
+          git submodule status --recursive
+
+      - name: Build RELEASE firmware with simplefb GOP and ECAM
+        env:
+          EDK2_TARGET: RELEASE
+        run: |
+          set -euo pipefail
+          ./build.sh -D VIRTIO_GPU_ENABLE=FALSE -D PCI_CAM_MODE=FALSE \
+            2>&1 | tee "$RUNNER_TEMP/firmware-build.log"
+
+      - name: Validate and package firmware
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          image = Path('edk2-gunyah.fd').read_bytes()
+          assert len(image) == 0x400000, f'unexpected firmware length: {len(image)}'
+          assert image[0x38:0x3c] == b'ARMd', 'missing ARM64 Linux boot header'
+          assert struct.unpack_from('<Q', image, 8)[0] == 0, 'nonzero text_offset'
+          assert struct.unpack_from('<Q', image, 16)[0] == len(image), 'image_size mismatch'
+          assert Path('edk2-gunyah.vars.fd').stat().st_size > 0, 'missing variable-store template'
+          print(f'ARM64 boot header and {len(image)}-byte firmware verified')
+          PY
+          mkdir -p dist
+          cp edk2-gunyah.fd dist/edk2-macos.fd
+          cp edk2-gunyah.vars.fd dist/edk2-macos.vars.fd
+          {
+            echo 'source=https://github.com/Droid-VM/edk2-gunyah'
+            echo "source_commit=$(git rev-parse HEAD)"
+            echo "edk2_commit=$(git -C edk2 rev-parse HEAD)"
+            echo 'target=RELEASE'
+            echo 'arch=AARCH64'
+            echo 'VIRTIO_GPU_ENABLE=FALSE'
+            echo 'PCI_CAM_MODE=FALSE (ECAM)'
+            echo 'This is guest UEFI firmware; it is not an Android boot or partition image.'
+            echo 'Use a separate macOS VM firmware path; do not replace Windows firmware.'
+            echo 'The vars template is optional; the reference macOS VM does not enable persistent UEFI vars.'
+            echo
+            git submodule status --recursive
+          } > dist/build-info.txt
+          (cd dist && sha256sum edk2-macos.fd edk2-macos.vars.fd build-info.txt > SHA256SUMS)
+
+      - name: Upload dedicated macOS guest firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: edk2-macos-novgpu-ee11a290-ecam
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edk2-macos-novgpu-build-log
+          path: ${{ runner.temp }}/firmware-build.log
+          if-no-files-found: ignore
+          retention-days: 7
