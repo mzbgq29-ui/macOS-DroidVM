@@ -1,0 +1,227 @@
+name: Validate an existing encrypted image
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Completed image workflow run in this repository
+        type: string
+        required: true
+        default: "44723953351"
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: validate-existing-image-${{ inputs.source_run }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_RUN: ${{ inputs.source_run }}
+      RECOVERY: ${{ github.workspace }}/image-validation
+      VALIDATOR_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check out only the trusted verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/verify-image-pair.py
+          sparse-checkout-cone-mode: false
+      - name: Validate the source run and prepare disk space
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, shutil, subprocess
+          from pathlib import Path
+          run = os.environ['SOURCE_RUN']
+          if not re.fullmatch(r'[0-9]+', run):
+              raise SystemExit('source_run must contain ASCII digits only')
+          repo = os.environ['GH_REPO']
+          source = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run}'], text=True))
+          assert source['repository']['full_name'] == repo, 'source repository mismatch'
+          assert source['head_repository']['full_name'] == repo, 'source head repository mismatch'
+          assert source['path'] == '.github/workflows/image.yml', 'source is not image.yml'
+          assert source['event'] == 'workflow_dispatch', 'source was not manually dispatched'
+          assert source['status'] == 'completed', 'source has not completed'
+          assert str(source['id']) == str(int(run)), 'source run ID mismatch'
+          assert isinstance(source['run_number'], int) and source['run_number'] > 0, 'invalid source run number'
+          assert re.fullmatch(r'[0-9a-f]{40}', source['head_sha']), 'invalid source commit'
+          root = Path(os.environ['RECOVERY'])
+          root.mkdir(parents=True, exist_ok=True)
+          # Reserve room for both the 13.2 GB ZIP and its encrypted parts.
+          # Only remove known runner preinstalls when needed, never workspace data.
+          if shutil.disk_usage(root).free < 42 * 1024**3:
+              subprocess.run(['sudo', 'rm', '-rf', '/usr/share/dotnet', '/usr/local/lib/android', '/opt/ghc',
+                              '/usr/local/.ghcup', '/opt/hostedtoolcache/CodeQL', '/usr/local/share/boost'], check=True)
+          assert shutil.disk_usage(root).free >= 42 * 1024**3, 'need at least 42 GiB free'
+          summary = {k: source[k] for k in ('id', 'run_number', 'head_sha', 'path', 'event', 'status', 'conclusion', 'html_url')}
+          summary['repository'] = repo
+          (root / 'source-run.json').write_text(json.dumps(summary, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"run_number={source['run_number']}\n")
+          print(json.dumps(summary, indent=2))
+          PY
+      - name: Prepare Linux archive and cryptographic tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd openssl
+          command -v gh
+          python3 --version
+          tar --version | head -n 1
+      - name: Download the complete encrypted image and its plain manifest
+        shell: bash
+        env:
+          SOURCE_NUMBER: ${{ steps.source.outputs.run_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RECOVERY/parts" "$RECOVERY/plain"
+          gh run download "$SOURCE_RUN" --repo "$GH_REPO" \
+            --name "image-27.2-$SOURCE_NUMBER" --dir "$RECOVERY/parts"
+          gh run download "$SOURCE_RUN" --repo "$GH_REPO" \
+            --name "image-27.2-$SOURCE_NUMBER-plain" --dir "$RECOVERY/plain"
+      - name: Validate provenance and all seven encrypted part hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RECOVERY'])
+          source = json.loads((root / 'source-run.json').read_text())
+          manifest = json.loads((root / 'plain/manifest.json').read_text())
+          layout = json.loads((root / 'plain/disk.json').read_text())
+          assert manifest['commit'] == source['head_sha'], 'artifact commit differs from source run'
+          assert manifest['product'] == 'k27', 'unexpected product'
+          assert manifest['tag'] == '27.2', 'unexpected manifest tag'
+          assert manifest['env']['MACOS_TAG'] == '27.2', 'unexpected product environment tag'
+          assert manifest['dirty'] is False, 'source tree was dirty'
+          assert layout['tag'] == '27.2', 'unexpected disk tag'
+          expected = [f'image.tar.zst.enc.{i:03d}' for i in range(7)]
+          lines = (root / 'plain/image.tar.zst.enc.sha256').read_text().splitlines()
+          rows = []
+          for line in lines:
+              match = re.fullmatch(r'([0-9a-f]{64})  (image\.tar\.zst\.enc\.[0-9]{3})', line)
+              assert match, 'invalid checksum-list row'
+              rows.append({'sha256': match[1], 'name': match[2]})
+          assert [row['name'] for row in rows] == expected, 'expected exactly .000 through .006, in order'
+          actual = sorted(p.name for p in (root / 'parts').iterdir())
+          assert actual == expected, 'missing or unexpected encrypted parts'
+          plain = ['disk.json', 'image.tar.zst.enc.sha256', 'manifest.json', 'provenance.json', 'sha256.txt']
+          assert sorted(p.name for p in (root / 'plain').iterdir()) == plain, 'unexpected plain companion contents'
+          for path in [*(root / 'parts').iterdir(), *(root / 'plain').iterdir()]:
+              assert path.is_file() and not path.is_symlink(), 'expected ordinary artifact files'
+          report = {'source_run': source, 'artifact': f"image-27.2-{source['run_number']}",
+                    'source_commit_matches_manifest': True, 'product': manifest['product'], 'tag': manifest['tag'],
+                    'encrypted_parts': [{**row, 'bytes': (root / 'parts' / row['name']).stat().st_size} for row in rows],
+                    'decrypted': False, 'device_boot_tested': False, 'performance_tested': False, 'sha256_verified': False}
+          (root / 'build-validation.json').write_text(json.dumps(report, indent=2) + '\n')
+          PY
+          (cd "$RECOVERY/parts" && sha256sum -c "$RECOVERY/plain/image.tar.zst.enc.sha256")
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RECOVERY']) / 'build-validation.json'
+          report = json.loads(path.read_text())
+          report['sha256_verified'] = True
+          path.write_text(json.dumps(report, indent=2) + '\n')
+          PY
+      - name: Decrypt only controlled image files into ephemeral sparse storage
+        shell: bash
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$ARTIFACT_KEY" ] || { echo '::error::ARTIFACT_KEY is not configured'; exit 1; }
+          mkdir -p "$RECOVERY/raw" "$RECOVERY/reports"
+          cat "$RECOVERY"/parts/image.tar.zst.enc.[0-9][0-9][0-9] \
+            | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ARTIFACT_KEY \
+            | zstd -d -q -c \
+            | tar --sparse --no-same-owner --no-same-permissions -C "$RECOVERY/raw" -xf - -- \
+                boot.img manifest.json kernel.macho.trustcache data-store.img scratch-data.img disk.json
+      - name: Verify boot payloads, root UUID, seed identity and store geometry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-image-pair.py "$RECOVERY/raw" --report "$RECOVERY/reports/pair-validation.json"
+      - name: Hash all controlled decrypted files and assemble small validation reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RECOVERY'])
+          raw = root / 'raw'
+          reports = root / 'reports'
+          source = json.loads((root / 'source-run.json').read_text())
+          precheck = json.loads((root / 'build-validation.json').read_text())
+          pair_path = reports / 'pair-validation.json'
+          pair = json.loads(pair_path.read_text())
+          assert pair['passed'] is True, 'pair verifier did not pass'
+          assert pair['commit'] == source['head_sha'], 'decrypted source commit mismatch'
+          assert pair['tag'] == '27.2', 'decrypted product tag mismatch'
+          assert pair['device_boot_tested'] is False and pair['performance_tested'] is False
+          assert precheck['sha256_verified'] is True, 'encrypted part hashes were not verified'
+          manifest = json.loads((raw / 'manifest.json').read_text())
+          layout = json.loads((raw / 'disk.json').read_text())
+          assert manifest == json.loads((root / 'plain/manifest.json').read_text()), 'plain and decrypted manifests differ'
+          assert layout == json.loads((root / 'plain/disk.json').read_text()), 'plain and decrypted disk layouts differ'
+          expected = ['boot.img', 'kernel.macho.trustcache', 'scratch-data.img', 'data-store.img', 'disk.json', 'manifest.json']
+          assert sorted(p.name for p in raw.iterdir()) == sorted(expected), 'unexpected decrypted contents'
+          files = []
+          for name in expected:
+              path = raw / name
+              assert path.is_file() and not path.is_symlink(), 'expected ordinary decrypted files'
+              h = hashlib.sha256()
+              with path.open('rb') as handle:
+                  while block := handle.read(8 << 20):
+                      h.update(block)
+              info = path.stat()
+              files.append({'name': name, 'sha256': h.hexdigest(), 'bytes': info.st_size, 'allocated_bytes': info.st_blocks * 512})
+              print(name, info.st_size, h.hexdigest(), flush=True)
+          (reports / 'image-files-SHA256SUMS').write_text(''.join(f"{f['sha256']}  {f['name']}\n" for f in files))
+          pair['source_run'] = source
+          pair['validator_commit'] = os.environ['VALIDATOR_COMMIT']
+          pair_path.write_text(json.dumps(pair, indent=2) + '\n')
+          report = {**precheck, 'decrypted': True, 'pair_validation_passed': True, 'all_file_sha256_computed': True,
+                    'validator_commit': os.environ['VALIDATOR_COMMIT'], 'device_boot_tested': False, 'performance_tested': False,
+                    'decrypted_files_published': False, 'decrypted_files': files,
+                    'validation_scope': 'Host-side archive integrity, source provenance, boot/data pairing and full-file hashes only. No guest binaries executed.'}
+          (reports / 'build-validation.json').write_text(json.dumps(report, indent=2) + '\n')
+          PY
+      - name: Publish only the three small validation reports
+        shell: bash
+        env:
+          SOURCE_NUMBER: ${{ steps.source.outputs.run_number }}
+        run: |
+          set -euo pipefail
+          release="image-27.2-$SOURCE_NUMBER"
+          gh release view "$release" --repo "$GH_REPO" >/dev/null
+          gh release upload "$release" --repo "$GH_REPO" --clobber \
+            "$RECOVERY/reports/pair-validation.json" \
+            "$RECOVERY/reports/build-validation.json" \
+            "$RECOVERY/reports/image-files-SHA256SUMS"
+      - name: Upload only the small validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-validation-${{ inputs.source_run }}
+          path: |-
+            ${{ github.workspace }}/image-validation/reports/pair-validation.json
+            ${{ github.workspace }}/image-validation/reports/build-validation.json
+            ${{ github.workspace }}/image-validation/reports/image-files-SHA256SUMS
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Remove ephemeral decrypted system and credential data
+        if: always()
+        shell: bash
+        run: |
+          rm -rf -- "$RECOVERY/raw"
