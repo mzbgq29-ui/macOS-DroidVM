@@ -1,0 +1,95 @@
+name: Recover a single ready-to-import macOS package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cloud-ready-vmpkg-27.2-1
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WORK: ${{ runner.temp }}/cloud-vmpkg
+    steps:
+      - name: Check out pinned recovery tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/cloud_vmpkg.py
+            scripts/vmpkg_tool.py
+            configs/transport-27.2-1.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare ephemeral runner storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          for command in python3 curl openssl gh; do command -v "$command"; done
+          mkdir -p "$WORK"
+
+      - name: Merge and decrypt the seven verified pieces in the cloud
+        env:
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 scripts/cloud_vmpkg.py --work "$WORK" --anchor configs/transport-27.2-1.json
+
+      - name: Upload the complete original vmpkg as one downloadable file
+        id: ready
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          path: ${{ runner.temp }}/cloud-vmpkg/ready/macOS-27.2-DroidVM.vmpkg
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Check the uploaded artifact digest and record its download URL
+        env:
+          ARTIFACT_ID: ${{ steps.ready.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.ready.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.ready.outputs.artifact-digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['WORK'])
+          report = json.loads((root / 'cloud-recovery-report.json').read_text())
+          actual = os.environ['ARTIFACT_DIGEST'].removeprefix('sha256:')
+          if actual != report['package_sha256']:
+              raise SystemExit('Uploaded raw artifact digest does not match the original package')
+          report.update(artifact_id=int(os.environ['ARTIFACT_ID']), artifact_url=os.environ['ARTIFACT_URL'], raw_file=True)
+          (root / 'cloud-download-report.json').write_text(json.dumps(report, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Ready-to-import single-file package: [' + report['package_filename'] + '](' + report['artifact_url'] + ')\n\n')
+              summary.write('Bytes: ' + str(report['package_bytes']) + '\n\nSHA256: `' + report['package_sha256'] + '`\n\n')
+              summary.write('Download requires GitHub sign-in. Retention: 7 days. Device boot and performance remain untested.\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload the small download and integrity report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          path: ${{ runner.temp }}/cloud-vmpkg/cloud-download-report.json
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove ephemeral downloads and decrypted files
+        if: always()
+        shell: bash
+        run: rm -rf -- "$WORK"

@@ -1,0 +1,57 @@
+{
+  "package_filename": "macOS-27.2-DroidVM.vmpkg",
+  "plaintext_package_bytes": 13388320768,
+  "plaintext_package_sha256": "d958b23b9edc997560dad06234cb389e74230759eb65426fab59275de1870ad8",
+  "encrypted_parts": [
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.000",
+      "bytes": 1992294400,
+      "sha256": "02a344b0068ccfe75be360af541fbad1a47ac52df85e3422854db7a9eb327120"
+    },
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.001",
+      "bytes": 1992294400,
+      "sha256": "bbb507d79f43ca8097fcea13896614faa7d8c1ba7a00fe709929c9f6ba41c080"
+    },
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.002",
+      "bytes": 1992294400,
+      "sha256": "543d1269c9c9acb133a875dda49f128946b500cc8429f7b2ede46db3b19c8f1c"
+    },
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.003",
+      "bytes": 1992294400,
+      "sha256": "0a8238ceb3febd7c1e63f81638e428338ed8dd3027cf3bdc2c94b6c01b0a86fc"
+    },
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.004",
+      "bytes": 1992294400,
+      "sha256": "db1c7a63866de5ca7a9fa8bb3dfaf9f06474d341b9716bd0995517f30ed285eb"
+    },
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.005",
+      "bytes": 1992294400,
+      "sha256": "4b5918ee5b9d6ca771f9161cb6cfa475ca7804ec0d576107ead5f3ae5aeb2877"
+    },
+    {
+      "name": "macOS-27.2-DroidVM.vmpkg.enc.006",
+      "bytes": 1434554400,
+      "sha256": "b8777deac40beb88ad1d743d0c99ddd52eb3f725a7177a7f4dd89a5e4e4b4c01"
+    }
+  ],
+  "package_payloads": {
+    "boot.img": {
+      "size": 402653184,
+      "sha256": "11c342256e1ad07d4e161b0b4854615c691e3382788ce3402f0d38a18e58cc59"
+    },
+    "data-pcie.img": {
+      "size": 51541704704,
+      "sha256": "1b5f63de2d4eb4c0251f4430c560d551bb14037f40caa702edaa0daa426fcb19"
+    },
+    "edk2-macos.fd": {
+      "size": 4194304,
+      "sha256": "ab69e017d2965d73ed2057bed8922a3908639021984bf250ec530cb6cb60cc4d"
+    }
+  },
+  "app_version_code": 5090
+}
