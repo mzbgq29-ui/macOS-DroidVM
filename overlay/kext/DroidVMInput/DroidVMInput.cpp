@@ -200,7 +200,6 @@ struct DroidVMInputDevice {
   struct { bool down = false; int32_t id = -1, x = 0, y = 0, mmX = 0, mmY = 0; uint32_t milliseconds = 0; } sent[maxSlots];
   uint8_t frame = 0;
   uint32_t milliseconds = 0;
-  unsigned reports = 0;
   DroidVMHIDDevice *hid = nullptr;
   Descriptor *descriptors() { return reinterpret_cast<Descriptor *>(base); }
   volatile uint16_t *available() { return reinterpret_cast<volatile uint16_t *>(base + 1024); }
@@ -854,9 +853,6 @@ void DroidVMInput::report(DroidVMInputDevice &d)
   if (!d.hid || !memcmp(bytes, d.last, length))
     return;
   memcpy(d.last, bytes, length);
-  if (++d.reports <= 20 || d.reports % 500 == 0)   // bring-up: are the events getting through
-    IOLog("DroidVMInput: %s report %u: %02x %02x %02x %02x %02x %02x %02x %02x\n", kindName(d.kind), d.reports, bytes[0], bytes[1],
-          bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   if (report) {
     recordTime(d);

@@ -26,7 +26,6 @@ state = source[source.index('  Kind kind = Kind::none;'):source.index('  DroidVM
 # Select the wire event constants and device kinds, without IOKit configuration constants.
 enums = source[source.index('enum : uint16_t { evSyn'):source.index('constexpr unsigned maxDevices')]
 identify = source[source.index('unsigned configBytes('):source.index('IOBufferMemoryDescriptor *contiguous(')]
-kind_name = source[source.index('const char *kindName('):source.index('}  // namespace\n\nbool DroidVMInput::start(')]
 mt = source[source.index('namespace mt {'):source.index('// A feature report', source.index('namespace mt {'))]
 scale = source[source.index('int32_t scale('):source.index('OSDictionary *multitouchProperties(')]
 program = r'''
@@ -40,7 +39,6 @@ constexpr unsigned maxSlots = 10, fingers = 4;
 constexpr int32_t tabletRange = 0x8000;
 constexpr int kIODirectionNone = 0;
 bool gTouchTablet = false;
-template<class... A> void IOLog(const char *, A...) {}
 uint64_t mach_absolute_time() { static uint64_t now = 0; return now += 1000000; }
 void absolutetime_to_nanoseconds(uint64_t value, uint64_t *out) { *out = value; }
 struct IOBufferMemoryDescriptor {
@@ -113,7 +111,7 @@ public:
     serializePathFrame(d, stages);
   }
 };
-''' + identify + kind_name + method('event') + method('report') + method('multitouch') + method('pathFrame').replace('DroidVMInput::pathFrame(', 'DroidVMInput::serializePathFrame(', 1) + r'''
+''' + identify + method('event') + method('report') + method('multitouch') + method('pathFrame').replace('DroidVMInput::pathFrame(', 'DroidVMInput::serializePathFrame(', 1) + r'''
 void abs(DroidVMInput &input, DroidVMInputDevice &d, uint16_t code, int value) {
   input.event(d, {evAbs, code, value});
 }
