@@ -11,7 +11,7 @@
 //     it, then Apple's multitouch protocol (feature reports and path frames, below) for HSTouchHIDService.plugin;
 //   - an absolute pointer: the tablet report (absolute X/Y 0..32767, three buttons, wheel);
 //   - a relative mouse: the boot mouse report.
-// Enumerated PCI devices use MSI-X; the raw ECAM mode retains its 4 ms polling thread.
+// Enumerated PCI devices normally use MSI-X. Raw ECAM and PCI without working vectors use polling.
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
@@ -42,13 +42,15 @@ enum : uint16_t {
   relX = 0x00, relY = 0x01, relWheel = 0x08, keyA = 30, btnLeft = 0x110, btnRight = 0x111, btnMiddle = 0x112, btnTouch = 0x14a,
 };
 enum : uint8_t { cfgSelect = 0, cfgSubsel = 1, cfgSize = 2, cfgData = 8 };
-enum : uint8_t { cfgEvBits = 0x11, cfgAbsInfo = 0x12 };
-enum class Kind : uint8_t { none, touch, pointer, mouse, keyboard };
+enum : uint8_t { cfgPropBits = 0x10, cfgEvBits = 0x11, cfgAbsInfo = 0x12 };
+enum : uint8_t { inputPropPointer = 0, inputPropDirect = 1 };
+enum class Kind : uint8_t { none, touch, touchpad, pointer, mouse, keyboard };
+
+bool slotInput(Kind kind) { return kind == Kind::touch || kind == Kind::touchpad; }
 
 constexpr unsigned maxDevices = 8, maxSlots = 10, maxQueue = 64, pollMs = 4, fingers = 4;
 constexpr int32_t tabletRange = 0x8000;
 bool gTouchTablet = false;  // droidvm-touch-digitizer=0 explicitly selects legacy pointer emulation
-char gDisplayUUID[40];      // the built-in digitizer's displayUUID, empty for Sidecar's
 
 // usb_kbd_keycode of Linux (drivers/hid/usbhid/usbkbd.c): HID usage -> Linux key code; inverted at start.
 const uint8_t hidToLinux[256] = {
@@ -213,6 +215,7 @@ class DroidVMHIDDevice : public IOHIDDevice {
 public:
   DroidVMInputDevice *fDevice = nullptr;
   unsigned fIndex = 0;
+  char fDisplayUUID[40] = {};   // empty for pointer devices and Sidecar mode
 
   IOReturn newReportDescriptor(IOMemoryDescriptor **descriptor) const override;
   OSString *newTransportString() const override { return OSString::withCString("Virtual"); }
@@ -273,6 +276,7 @@ IOReturn DroidVMHIDDevice::newReportDescriptor(IOMemoryDescriptor **descriptor) 
 OSString *DroidVMHIDDevice::newProductString() const
 {
   return OSString::withCString(fDevice->kind == Kind::keyboard ? "DroidVM Keyboard" : fDevice->kind == Kind::touch ? "DroidVM Touch Screen"
+                               : fDevice->kind == Kind::touchpad ? "DroidVM Trackpad"
                                : fDevice->kind == Kind::mouse ? "DroidVM Mouse" : "DroidVM Tablet");
 }
 
@@ -303,6 +307,9 @@ class DroidVMInput : public IOService {
   static void pollThread(void *self, wait_result_t);
   static void interruptAction(OSObject *owner, IOInterruptEventSource *sender, int count);
   void publishTimes();
+  bool setupInterrupts(IOPCIDevice *pci);
+  bool startPolling();
+  void releaseInterrupts();
   void releaseResources();
   void poll(DroidVMInputDevice &d);
   void event(DroidVMInputDevice &d, const Event &e);
@@ -354,8 +361,16 @@ Kind identify(DroidVMInputDevice &d)
   unsigned nabs = configBytes(d, cfgEvBits, evAbs, abs, sizeof(abs));
   unsigned nrel = configBytes(d, cfgEvBits, evRel, rel, sizeof(rel));
   unsigned nkeys = configBytes(d, cfgEvBits, evKey, keys, sizeof(keys));
-  if (bit(abs, nabs, absMtPositionX) && bit(abs, nabs, absMtPositionY) &&
-      axis(d, absMtPositionX, &d.minX, &d.spanX) && axis(d, absMtPositionY, &d.minY, &d.spanY)) return Kind::touch;
+  if (bit(abs, nabs, absMtSlot) && bit(abs, nabs, absMtPositionX) && bit(abs, nabs, absMtPositionY) &&
+      axis(d, absMtPositionX, &d.minX, &d.spanX) && axis(d, absMtPositionY, &d.minY, &d.spanY)) {
+    uint8_t properties[4] = {};
+    const unsigned count = configBytes(d, cfgPropBits, 0, properties, sizeof(properties));
+    // A crosvm trackpad can have the same slot axes as the real touch screen. Never
+    // publish it as a second built-in Apple digitizer for the same display UUID.
+    if (bit(properties, count, inputPropPointer) && !bit(properties, count, inputPropDirect))
+      return Kind::touchpad;
+    return Kind::touch;
+  }
   if (bit(abs, nabs, absX) && bit(abs, nabs, absY) && axis(d, absX, &d.minX, &d.spanX) && axis(d, absY, &d.minY, &d.spanY))
     return Kind::pointer;
   if (bit(rel, nrel, relX) && bit(rel, nrel, relY)) return Kind::mouse;
@@ -374,7 +389,7 @@ IOBufferMemoryDescriptor *contiguous(unsigned bytes, uint64_t *physical)
   return memory;
 }
 
-bool configure(DroidVMInputDevice &d, bool activate)
+bool configure(DroidVMInputDevice &d)
 {
   if (!d.transport.hasDeviceConfig() || !d.transport.negotiate(0)) return false;
   d.kind = identify(d);
@@ -398,11 +413,6 @@ bool configure(DroidVMInputDevice &d, bool activate)
   dmaBarrier();
   if (!d.transport.enableQueue(0, d.size, physical, physical + 1024, physical + 2048) ||
       !d.transport.enableQueue(1, statusSize, statusPhysical, statusPhysical + 1024, statusPhysical + 2048)) return false;
-  if (activate) {
-    d.transport.setStatus(virtio_pci::statusAcknowledge | virtio_pci::statusDriver | virtio_pci::statusFeaturesOk |
-                          virtio_pci::statusDriverOk);
-    d.transport.notify(0);
-  }
   return true;
 }
 
@@ -446,7 +456,8 @@ OSDictionary *multitouchProperties()
 
 const char *kindName(Kind kind)
 {
-  return kind == Kind::touch ? "touch screen" : kind == Kind::pointer ? "tablet" : kind == Kind::mouse ? "mouse" : "keyboard";
+  return kind == Kind::touch ? "touch screen" : kind == Kind::touchpad ? "trackpad"
+       : kind == Kind::pointer ? "tablet" : kind == Kind::mouse ? "mouse" : "keyboard";
 }
 
 }  // namespace
@@ -468,13 +479,14 @@ bool DroidVMInput::start(IOService *provider)
     return false;
   }
   unsigned functions = 0;
+  bool builtInTouch = false;
   for (unsigned index = 0; index < (pci ? 1 : maxDevices) && fCount < maxDevices; ++index) {
     DroidVMInputDevice &d = fDevices[fCount];
     if (!(pci ? d.transport.open(pci) :
           d.transport.open(static_cast<uintptr_t>(fEcam->getVirtualAddress()), fEcam->getLength(), virtio_pci::deviceInput, index)))
       break;
     ++functions;
-    if (!configure(d, !pci)) {
+    if (!configure(d)) {
       d.transport.reset();
       d.transport.close();
       OSSafeReleaseNULL(d.memory);
@@ -493,9 +505,9 @@ bool DroidVMInput::start(IOService *provider)
       hid->setProperty(kIOHIDBuiltInKey, true);   // the touch processor takes a display's touches from a built-in one only
       // SkyLight's handle_digitizer_added drops a digitizer whose displayUUID (a CFUUID string) names no display it knows:
       // DroidVMDisplay's IOMFBUUID unless droidvm-touch-display-uuid says otherwise.
-      strlcpy(gDisplayUUID, "44726F69-6456-4D00-0000-000000000001", sizeof(gDisplayUUID));
-      PE_parse_boot_argn("droidvm-touch-display-uuid", gDisplayUUID, sizeof(gDisplayUUID) - 1);
-      hid->setProperty("displayUUID", gDisplayUUID);
+      strlcpy(hid->fDisplayUUID, "44726F69-6456-4D00-0000-000000000001", sizeof(hid->fDisplayUUID));
+      PE_parse_boot_argn("droidvm-touch-display-uuid", hid->fDisplayUUID, sizeof(hid->fDisplayUUID) - 1);
+      hid->setProperty("displayUUID", hid->fDisplayUUID);
       // What the touch MacBook Pro's touch controller (its firmware's "kiwi" interface) has AppleMultitouchHIDService give its
       // AppleMultitouchDevice, which looks for the property up its providers: HSTouchHIDService.plugin rather than the personality's
       // MultitouchHID.plugin, whose sensing algorithms stage is the generic touch one (the second of the controller's; the first,
@@ -513,74 +525,109 @@ bool DroidVMInput::start(IOService *provider)
       hid->detach(this);
       OSSafeReleaseNULL(hid);
     }
+    if (!hid) {
+      IOLog("DroidVMInput: function %u could not publish %s HID device\n", d.transport.pciSlot(), kindName(d.kind));
+      d.transport.reset();
+      d.transport.close();
+      OSSafeReleaseNULL(d.memory);
+      OSSafeReleaseNULL(d.status);
+      d = DroidVMInputDevice();
+      continue;
+    }
     d.hid = hid;
-    IOLog("DroidVMInput: function %u: %s, x %d+%d, y %d+%d%s\n", d.transport.pciSlot(), kindName(d.kind), d.minX, d.spanX, d.minY,
-          d.spanY, hid ? "" : " (no HID device)");
+    builtInTouch |= hid->fDisplayUUID[0] != '\0';
+    IOLog("DroidVMInput: function %u: %s, x %d+%d, y %d+%d\n", d.transport.pciSlot(), kindName(d.kind), d.minX, d.spanX, d.minY,
+          d.spanY);
     ++fCount;
   }
   IOLog("DroidVMInput: %u device(s) of %u virtio-input function(s)\n", fCount, functions);
   // The event service WindowServer gets for the digitizer is AppleMultitouchDevice (under AppleMultitouchHIDService, on the device's
   // IOHIDInterface): SkyLight's handle_digitizer_added takes a digitizer only with a displayUUID, which on a Mac with a touch screen
   // its display has given it.
-  if (gDisplayUUID[0]) {
+  if (builtInTouch) {
     OSDictionary *matching = IOService::serviceMatching("AppleMultitouchDevice");
     if (matching)
       fMultitouchNotifier = IOService::addMatchingNotification(gIOFirstPublishNotification, matching, multitouchPublished, this, nullptr);
     OSSafeReleaseNULL(matching);
   }
-  if (!fCount)
+  if (!fCount) {
+    releaseResources();
     return false;
+  }
   uint32_t recordTimes = 0;
   fRecordTimes = PE_parse_boot_argn("droidvm-input-times", &recordTimes, sizeof(recordTimes)) && recordTimes;
-  if (pci) {
-    IOReturn result = pci->configureInterrupts(kIOInterruptTypePCIMessagedX, 1, 1);
-    if (result != kIOReturnSuccess) {
-      IOLog("DroidVMInput: MSI-X allocation failed: 0x%x\n", result);
+  const bool interrupt = pci && setupInterrupts(pci);
+  if (!interrupt) {
+    if (pci) {
+      releaseInterrupts();
+      // Leave queue notifications suppressed. Driver OK is still clear, so the
+      // host has not started the queues with the rejected MSI-X configuration.
+      auto &transport = fDevices[0].transport;
+      transport.disableConfigInterrupt();
+      transport.setQueueVector(0, 0xffff);
+      transport.setQueueVector(1, 0xffff);
+      IOLog("DroidVMInput: function %u falling back to PCI queue polling\n", pci->getDeviceNumber());
+    }
+    if (!startPolling()) {
       releaseResources();
       return false;
     }
-    fInterruptLoop = IOWorkLoop::workLoop();
-    fInterrupt = IOInterruptEventSource::interruptEventSource(this, interruptAction, pci, 0);
-    result = fInterruptLoop && fInterrupt ? fInterruptLoop->addEventSource(fInterrupt) : kIOReturnNoResources;
-    if (result != kIOReturnSuccess) {
-      IOLog("DroidVMInput: MSI-X event source setup failed: 0x%x (loop %u, source %u)\n", result,
-            fInterruptLoop != nullptr, fInterrupt != nullptr);
-      releaseResources();
-      return false;
-    }
-    auto &transport = fDevices[0].transport;
-    transport.disableConfigInterrupt();
-    if (!transport.setQueueVector(0, 0) || !transport.setQueueVector(1, 0xffff)) {
-      IOLog("DroidVMInput: MSI-X queue vector rejected\n");
-      releaseResources();
-      return false;
-    }
-    // Queue setup suppressed notifications until both the HID device and IRQ handler were ready.
-    fDevices[0].available()[0] = 0;
-    dmaBarrier();
-    fInterrupt->enable();
-    // crosvm snapshots queue vectors at activation, so publish DRIVER_OK only after mapping them.
-    transport.setStatus(virtio_pci::statusAcknowledge | virtio_pci::statusDriver | virtio_pci::statusFeaturesOk |
-                        virtio_pci::statusDriverOk);
-    transport.notify(0);
-    // Reap completions that arrived before notifications were enabled, on the same work loop as IRQs.
-    fInterrupt->interruptOccurred(nullptr, pci, 0);
-    setProperty("InputNotificationMode", "MSI-X");
-    IOLog("DroidVMInput: function %u MSI-X event queue vector 0 enabled\n", pci->getDeviceNumber());
-  } else {
-    fPollLock = IOLockAlloc();
-    if (!fPollLock) { releaseResources(); return false; }
-    thread_t thread;
-    fPolling = true;
-    if (kernel_thread_start(pollThread, this, &thread) != KERN_SUCCESS) {
-      fPolling = false;
-      releaseResources();
-      return false;
-    }
-    thread_deallocate(thread);
-    setProperty("InputNotificationMode", "ECAM polling");
   }
+  for (unsigned i = 0; i < fCount; ++i) {
+    auto &d = fDevices[i];
+    // Publish DRIVER_OK after HID attachment and after installing the selected
+    // queue consumer. crosvm snapshots queue vectors during activation.
+    d.transport.setStatus(virtio_pci::statusAcknowledge | virtio_pci::statusDriver | virtio_pci::statusFeaturesOk |
+                          virtio_pci::statusDriverOk);
+    d.transport.notify(0);
+  }
+  if (interrupt) {
+    fInterrupt->interruptOccurred(nullptr, pci, 0);
+    IOLog("DroidVMInput: function %u MSI-X event queue vector 0 enabled\n", pci->getDeviceNumber());
+  }
+  setProperty("InputNotificationMode", interrupt ? "MSI-X" : pci ? "PCI polling" : "ECAM polling");
   registerService();
+  return true;
+}
+
+bool DroidVMInput::setupInterrupts(IOPCIDevice *pci)
+{
+  IOReturn result = pci->configureInterrupts(kIOInterruptTypePCIMessagedX, 1, 1);
+  if (result != kIOReturnSuccess) {
+    IOLog("DroidVMInput: MSI-X allocation failed: 0x%x\n", result);
+    return false;
+  }
+  fInterruptLoop = IOWorkLoop::workLoop();
+  fInterrupt = IOInterruptEventSource::interruptEventSource(this, interruptAction, pci, 0);
+  result = fInterruptLoop && fInterrupt ? fInterruptLoop->addEventSource(fInterrupt) : kIOReturnNoResources;
+  if (result != kIOReturnSuccess) {
+    IOLog("DroidVMInput: MSI-X event source setup failed: 0x%x (loop %u, source %u)\n", result,
+          fInterruptLoop != nullptr, fInterrupt != nullptr);
+    return false;
+  }
+  auto &d = fDevices[0];
+  d.transport.disableConfigInterrupt();
+  if (!d.transport.setQueueVector(0, 0) || !d.transport.setQueueVector(1, 0xffff)) {
+    IOLog("DroidVMInput: MSI-X queue vector rejected\n");
+    return false;
+  }
+  d.available()[0] = 0;
+  dmaBarrier();
+  fInterrupt->enable();
+  return true;
+}
+
+bool DroidVMInput::startPolling()
+{
+  fPollLock = IOLockAlloc();
+  if (!fPollLock) return false;
+  thread_t thread;
+  fPolling = true;
+  if (kernel_thread_start(pollThread, this, &thread) != KERN_SUCCESS) {
+    fPolling = false;
+    return false;
+  }
+  thread_deallocate(thread);
   return true;
 }
 
@@ -622,18 +669,23 @@ void DroidVMInput::interruptAction(OSObject *owner, IOInterruptEventSource *, in
   input->publishTimes();
 }
 
-void DroidVMInput::releaseResources()
+void DroidVMInput::releaseInterrupts()
 {
-  if (fMultitouchNotifier) {
-    fMultitouchNotifier->remove();
-    fMultitouchNotifier = nullptr;
-  }
   if (fInterrupt) {
     fInterrupt->disable();
     if (fInterrupt->getWorkLoop()) fInterruptLoop->removeEventSource(fInterrupt);
     OSSafeReleaseNULL(fInterrupt);
   }
   OSSafeReleaseNULL(fInterruptLoop);
+}
+
+void DroidVMInput::releaseResources()
+{
+  if (fMultitouchNotifier) {
+    fMultitouchNotifier->remove();
+    fMultitouchNotifier = nullptr;
+  }
+  releaseInterrupts();
   for (unsigned i = 0; i < fCount; ++i) {
     auto &d = fDevices[i];
     d.transport.reset();
@@ -717,13 +769,13 @@ void DroidVMInput::event(DroidVMInputDevice &d, const Event &e)
   }
   if (e.type == evKey) {
     uint8_t mask = e.code == btnLeft || e.code == btnTouch ? 1 : e.code == btnRight ? 2 : e.code == btnMiddle ? 4 : 0;
-    if (d.kind != Kind::touch)
+    if (!slotInput(d.kind))
       d.buttons = e.value ? d.buttons | mask : d.buttons & ~mask;
   } else if (e.type == evRel) {
     if (e.code == relX) d.dx += e.value;
     else if (e.code == relY) d.dy += e.value;
     else if (e.code == relWheel) d.wheel += e.value;
-  } else if (e.type == evAbs && d.kind == Kind::touch) {
+  } else if (e.type == evAbs && slotInput(d.kind)) {
     if (e.code == absMtSlot) d.slot = e.value >= 0 && e.value < static_cast<int32_t>(maxSlots) ? static_cast<unsigned>(e.value) : maxSlots;
     else if (d.slot < maxSlots) {
       if (e.code == absMtTrackingId) {
@@ -772,7 +824,7 @@ void DroidVMInput::report(DroidVMInputDevice &d)
   } else {
     int32_t x = d.x, y = d.y;
     uint8_t buttons = d.buttons;
-    if (d.kind == Kind::touch) {
+    if (slotInput(d.kind)) {
       // The first finger down (else the last position) is the pointer; any finger down is the left button.
       buttons = 0;
       for (const auto &s : d.slots)
@@ -948,12 +1000,15 @@ void DroidVMInput::pathFrame(DroidVMInputDevice &d, const uint8_t *stages)
   }
 }
 
-bool DroidVMInput::multitouchPublished(void *, void *, IOService *service, IONotifier *)
+bool DroidVMInput::multitouchPublished(void *target, void *, IOService *service, IONotifier *)
 {
+  auto *input = static_cast<DroidVMInput *>(target);
   for (IOService *provider = service->getProvider(); provider; provider = provider->getProvider())
-    if (OSDynamicCast(DroidVMHIDDevice, provider)) {
-      service->setProperty("displayUUID", gDisplayUUID);
-      IOLog("DroidVMInput: %s gets displayUUID %s\n", service->getMetaClass()->getClassName(), gDisplayUUID);
+    if (auto *hid = OSDynamicCast(DroidVMHIDDevice, provider)) {
+      if (hid->getProvider() == input && hid->fDisplayUUID[0]) {
+        service->setProperty("displayUUID", hid->fDisplayUUID);
+        IOLog("DroidVMInput: %s gets displayUUID %s\n", service->getMetaClass()->getClassName(), hid->fDisplayUUID);
+      }
       break;
     }
   return true;

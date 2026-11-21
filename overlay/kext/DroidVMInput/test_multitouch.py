@@ -7,7 +7,6 @@ or claim that a real macOS/Android input session has been tested.
 """
 from pathlib import Path
 import argparse
-import re
 import subprocess
 import tempfile
 
@@ -25,18 +24,23 @@ def method(name):
 # are compiled into this fixture as well as the two production methods below.
 state = source[source.index('  Kind kind = Kind::none;'):source.index('  DroidVMHIDDevice *hid = nullptr;')]
 # Select the wire event constants and device kinds, without IOKit configuration constants.
-enums = '\n'.join(re.findall(r'enum : uint16_t[\s\S]*?;', source)[:2]) + '\n' + re.search(r'enum class Kind[^;]+;', source).group()
+enums = source[source.index('enum : uint16_t { evSyn'):source.index('constexpr unsigned maxDevices')]
+identify = source[source.index('unsigned configBytes('):source.index('IOBufferMemoryDescriptor *contiguous(')]
+kind_name = source[source.index('const char *kindName('):source.index('}  // namespace\n\nbool DroidVMInput::start(')]
 mt = source[source.index('namespace mt {'):source.index('// A feature report', source.index('namespace mt {'))]
-scale = source[source.index('int32_t scale('):source.index('int8_t clamp8(')]
+scale = source[source.index('int32_t scale('):source.index('OSDictionary *multitouchProperties(')]
 program = r'''
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <vector>
 constexpr unsigned maxSlots = 10, fingers = 4;
 constexpr int32_t tabletRange = 0x8000;
 constexpr int kIODirectionNone = 0;
+bool gTouchTablet = false;
+template<class... A> void IOLog(const char *, A...) {}
 uint64_t mach_absolute_time() { static uint64_t now = 0; return now += 1000000; }
 void absolutetime_to_nanoseconds(uint64_t value, uint64_t *out) { *out = value; }
 struct IOBufferMemoryDescriptor {
@@ -53,7 +57,34 @@ struct DroidVMHIDDevice {
 ''' + enums + '\n' + mt + '}\n' + scale + r'''
 struct Event { uint16_t type, code; int32_t value; };
 uint8_t linuxToHid[256] = {};
+struct DeviceConfig {
+  uint8_t select = 0, subsel = 0;
+  uint8_t properties = 0;
+  bool slots = true;
+  template<typename T> void setConfig(unsigned offset, T value) {
+    if (offset == cfgSelect) select = value;
+    if (offset == cfgSubsel) subsel = value;
+  }
+  template<typename T> T config(unsigned offset) const {
+    uint8_t bytes[20] = {};
+    unsigned size = 0;
+    if (select == cfgPropBits) { bytes[0] = properties; size = 1; }
+    if (select == cfgEvBits && subsel == evAbs) {
+      const unsigned axes[] = {absMtSlot, absMtPositionX, absMtPositionY};
+      for (unsigned index : axes)
+        if (index != absMtSlot || slots)
+          bytes[index / 8] |= 1 << (index % 8);
+      size = 8;
+    }
+    if (select == cfgAbsInfo && (subsel == absMtPositionX || subsel == absMtPositionY)) {
+      bytes[4] = 0xff; bytes[5] = 0x7f;
+      size = sizeof(bytes);
+    }
+    return offset == cfgSize ? size : offset >= cfgData && offset-cfgData < size ? bytes[offset-cfgData] : 0;
+  }
+};
 struct DroidVMInputDevice {
+  DeviceConfig transport;
 ''' + state + r'''
   DroidVMHIDDevice *hid = nullptr;
 };
@@ -67,7 +98,7 @@ public:
   unsigned wakes = 0;
   void event(DroidVMInputDevice &, const Event &);
   void multitouch(DroidVMInputDevice &);
-  void report(DroidVMInputDevice &d) { multitouch(d); }
+  void report(DroidVMInputDevice &d);
   void userActive() { ++wakes; }
   void recordTime(DroidVMInputDevice &) {}
   void serializePathFrame(DroidVMInputDevice &, const uint8_t *);
@@ -82,7 +113,7 @@ public:
     serializePathFrame(d, stages);
   }
 };
-''' + method('event') + '\n' + method('multitouch') + '\n' + method('pathFrame').replace('DroidVMInput::pathFrame(', 'DroidVMInput::serializePathFrame(', 1) + r'''
+''' + identify + kind_name + method('event') + method('report') + method('multitouch') + method('pathFrame').replace('DroidVMInput::pathFrame(', 'DroidVMInput::serializePathFrame(', 1) + r'''
 void abs(DroidVMInput &input, DroidVMInputDevice &d, uint16_t code, int value) {
   input.event(d, {evAbs, code, value});
 }
@@ -141,7 +172,42 @@ void expectReplacement(bool reuseSameId, bool liftOtherFinger) {
   sync(input, d);
   assert(input.frames.size() == 1 && input.frames[0].stage[0] == mt::touching);
 }
+void expectPointerTap(Kind kind, bool touchTablet) {
+  DroidVMInput input;
+  DroidVMInputDevice d;
+  DroidVMHIDDevice hid;
+  gTouchTablet = touchTablet;
+  d.hid = &hid;
+  d.kind = kind;
+  d.spanX = d.spanY = 32768;
+  down(input, d, 0, 33, 0x1234, 0x5678);
+  sync(input, d);
+  assert(input.frames.empty());
+  assert((hid.wire == std::vector<std::vector<uint8_t>>{{1, 0x34, 0x12, 0x78, 0x56, 0}}));
+  sync(input, d); // stationary keepalive must not double-click
+  assert(hid.wire.size() == 1);
+  abs(input, d, absMtTrackingId, -1);
+  sync(input, d);
+  assert(hid.wire.size() == 2);
+  assert((hid.wire.back() == std::vector<uint8_t>{0, 0x34, 0x12, 0x78, 0x56, 0}));
+  gTouchTablet = false;
+}
+void expectDistinctInputRoles() {
+  DroidVMInputDevice d;
+  d.transport.properties = 1 << inputPropDirect;
+  assert(identify(d) == Kind::touch);
+  assert(d.minX == 0 && d.spanX == 32768);
+  d.transport.properties = 1 << inputPropPointer;
+  assert(identify(d) == Kind::touchpad);
+  d.transport.properties = 0;
+  assert(identify(d) == Kind::touch); // older emulated screens without property bits
+  d.transport.slots = false;
+  assert(identify(d) == Kind::none); // cannot decode a type-A device as type B
+}
 int main() {
+  expectDistinctInputRoles();
+  expectPointerTap(Kind::touchpad, false);
+  expectPointerTap(Kind::touch, true);
   DroidVMInput input;
   DroidVMInputDevice d;
   DroidVMHIDDevice hid;
@@ -191,7 +257,7 @@ int main() {
   expectReplacement(false, false);
   expectReplacement(true, false);
   expectReplacement(false, true);
-  std::cout << "PASS: landing, stationary scan, cancellation, idle, invalid slot, tracking-ID replacement, same-ID reuse, concurrent lift\n";
+  std::cout << "PASS: device roles, pointer taps, landing, stationary scan, cancellation, idle, invalid slot, tracking-ID replacement, same-ID reuse, concurrent lift\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='droidvm-touch-') as tmp:
