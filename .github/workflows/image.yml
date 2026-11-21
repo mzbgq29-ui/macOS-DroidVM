@@ -199,6 +199,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ws
+      - name: Verify multitouch report sequences
+        working-directory: ws
+        run: python3 overlay/kext/DroidVMInput/test_multitouch.py
       - uses: ./ws/.github/actions/host
       - uses: actions/cache@v4
         with:
@@ -229,6 +232,25 @@ jobs:
           python3 scripts/product.py kernel
           python3 scripts/product.py kexts
           python3 scripts/product.py kc
+          # Missing DriverKit Serial can leave the I/O registry busy while
+          # InterfaceNamer waits to name en0. Check the built KC itself.
+          PYTHONPATH=scripts python3 - <<'PY_KC'
+          import mmap
+          from fileset_kc import Kernelcache
+
+          required = {
+              'com.apple.driver.driverkit.serial',
+              'com.unixnu.driver.DroidVMInput',
+              'com.unixnu.driver.DroidVMGpu',
+              'com.unixnu.driver.DroidVMAudio',
+              'com.unixnu.driver.DroidVMVideo',
+          }
+          with open('out/k27/kc-k27.bin', 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+              missing = required - Kernelcache(data).entries.keys()
+          if missing:
+              raise SystemExit('Missing drivers in kernel collection: ' + ', '.join(sorted(missing)))
+          print('Verified DriverKit Serial, input, GPU, audio, and video drivers in kernel collection')
+          PY_KC
           # one part: an artifact uploaded as it is is one file
           CI_BLOB_CHUNK=100G scripts/ci-blob.sh pack "$RUNNER_TEMP/kc/kc.tar.zst.enc" . out/k27/kc-k27.bin
           ccache -s

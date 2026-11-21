@@ -32,7 +32,7 @@ jobs:
       VMPKG_CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
       WORK: ${{ github.workspace }}/vmpkg-work
       PACKAGE_NAME: macOS-27.2-DroidVM.vmpkg
-      RECOVERY_PACKAGE_NAME: macOS-27.2-DroidVM-Native-Recovery-2.vmpkg
+      RECOVERY_PACKAGE_NAME: macOS-27.2-DroidVM-Native-Recovery-3.vmpkg
     steps:
       - name: Check out reviewed host tools and portable VM manifest
         uses: actions/checkout@v4

@@ -6,8 +6,8 @@
   "app_build_type": "debug",
   "compression": "ZSTD",
   "vm": {
-    "name": "macOS 27.2 (DroidVM Native Recovery 2)",
-    "notes": "Open the native GPU screen for both startup and the macOS desktop. SimpleFB stays enabled for firmware and early boot, which crosvm mirrors into the GPU screen until the guest takes over. Keep the packaged NAT network and hardware layout. COM1 is the primary console. Device boot and acceleration are not verified by CI.",
+    "name": "macOS 27.2 (DroidVM Native Recovery 3)",
+    "notes": "Open the native GPU screen for both startup and the macOS desktop. SimpleFB stays enabled for firmware and early boot, which crosvm mirrors into the GPU screen until the guest takes over. Video decode and encode use Android MediaCodec. The guest Metal path remains enabled. Keep the packaged NAT network and hardware layout. COM1 is the primary console. Device boot, input, networking, acceleration and performance are not verified by CI.",
     "backend": "crosvm",
     "hypervisor": "gunyah",
     "protected_vm": "pseudo_unprotected",
@@ -46,7 +46,7 @@
     "vpu_codec_enabled": true,
     "vpu_host_pool_mb": 8,
     "vpu_guest_pool_mb": 0,
-    "vpu_decoder_backend": "msm_vidc",
+    "vpu_decoder_backend": "mediacodec",
     "vpu_encoder_backend": "mediacodec",
     "motion_sensor": false,
     "boot": {

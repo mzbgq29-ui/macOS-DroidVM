@@ -190,12 +190,12 @@ struct DroidVMInputDevice {
   Kind kind = Kind::none;
   int32_t minX = 0, spanX = 1, minY = 0, spanY = 1;
   unsigned slot = 0;
-  struct { int32_t id = -1, x = 0, y = 0; } slots[maxSlots];
+  struct { int32_t id = -1, x = 0, y = 0; bool ended = false; } slots[maxSlots];
   int32_t x = 0, y = 0, dx = 0, dy = 0, wheel = 0;
   uint8_t buttons = 0, modifiers = 0, keys[6] = {};
   uint8_t last[5 * fingers] = {};
   // The digitizer's paths as last sent: where (virtio-input's units, then hundredths of a mm) and when.
-  struct { bool down = false; int32_t x = 0, y = 0, mmX = 0, mmY = 0; uint32_t milliseconds = 0; } sent[maxSlots];
+  struct { bool down = false; int32_t id = -1, x = 0, y = 0, mmX = 0, mmY = 0; uint32_t milliseconds = 0; } sent[maxSlots];
   uint8_t frame = 0;
   uint32_t milliseconds = 0;
   unsigned reports = 0;
@@ -726,8 +726,11 @@ void DroidVMInput::event(DroidVMInputDevice &d, const Event &e)
   } else if (e.type == evAbs && d.kind == Kind::touch) {
     if (e.code == absMtSlot) d.slot = e.value >= 0 && e.value < static_cast<int32_t>(maxSlots) ? static_cast<unsigned>(e.value) : maxSlots;
     else if (d.slot < maxSlots) {
-      if (e.code == absMtTrackingId) d.slots[d.slot].id = e.value < 0 ? -1 : e.value;
-      else if (e.code == absMtPositionX) d.slots[d.slot].x = e.value;
+      if (e.code == absMtTrackingId) {
+        auto &slot = d.slots[d.slot];
+        slot.ended |= slot.id >= 0 && e.value != slot.id;
+        slot.id = e.value < 0 ? -1 : e.value;
+      } else if (e.code == absMtPositionX) d.slots[d.slot].x = e.value;
       else if (e.code == absMtPositionY) d.slots[d.slot].y = e.value;
     }
   } else if (e.type == evAbs) {
@@ -810,14 +813,36 @@ void DroidVMInput::report(DroidVMInputDevice &d)
   }
 }
 
-// The digitizer's slots as multitouch paths (slot i is path i + 1), a frame when any finger lands, lifts or moves. A finger
+// The digitizer's slots as multitouch paths (slot i is path i + 1), including stationary scan/keepalive frames. A finger
 // that lands starts in range and makes touch, one that lifts breaks touch and goes out of range: two frames, a millisecond apart.
 void DroidVMInput::multitouch(DroidVMInputDevice &d)
 {
+  // A slot is storage, not a contact identity. Retire its previous path before reusing it, even when the host's lift and new
+  // touchdown share one SYN_REPORT (or the same tracking ID is reused). Keep the old position for the retirement frames.
+  uint8_t retired[maxSlots] = {}, outside[maxSlots] = {};
+  bool replaced = false;
+  for (unsigned i = 0; i < maxSlots; ++i) {
+    const auto &s = d.slots[i];
+    const auto &sent = d.sent[i];
+    if (!sent.down)
+      continue;
+    const bool replace = s.id >= 0 && (s.id != sent.id || s.ended);
+    const bool release = s.id < 0 || replace;
+    retired[i] = release ? mt::breakTouch : mt::touching;
+    outside[i] = release ? mt::outOfRange : mt::touching;
+    replaced |= replace;
+  }
+  if (replaced && d.hid) {
+    pathFrame(d, retired);
+    pathFrame(d, outside);
+    for (unsigned i = 0; i < maxSlots; ++i)
+      if (retired[i] == mt::breakTouch)
+        d.sent[i].down = false;
+  }
   uint8_t first[maxSlots] = {}, second[maxSlots] = {};
   bool changed = false, twice = false, landed = false;
   for (unsigned i = 0; i < maxSlots; ++i) {
-    const auto &s = d.slots[i];
+    auto &s = d.slots[i];
     auto &sent = d.sent[i];
     const bool down = s.id >= 0;
     if (down && !sent.down) {
@@ -830,8 +855,11 @@ void DroidVMInput::multitouch(DroidVMInputDevice &d)
       changed = twice = true;
     } else if (down) {
       first[i] = second[i] = mt::touching;
-      changed |= s.x != sent.x || s.y != sent.y;
+      // Preserve the explicit scan/keepalive frames InputForwarder sends while a finger rests.
+      changed = true;
     }
+    s.ended = false;
+    sent.id = s.id;
     if (down) {
       sent.x = s.x;
       sent.y = s.y;
