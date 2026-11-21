@@ -195,7 +195,8 @@ def boot(config, env, also_trust):
     os.environ['MACOS_TRUSTCACHE'] = str(trust)
     os.environ['MACOS_DATA_SEED'] = str(ROOT / config['boot']['seed'])
     app = load(ROOT / 'scripts/droidvm-app.py', 'droidvm_app')
-    image, line = app.build_boot(argparse.Namespace(kernel_arg=list(config['kernel_args'])), local=out / 'disk')
+    image, line = app.build_boot(argparse.Namespace(kernel_arg=list(config['kernel_args'])), local=out / 'disk',
+                                 menu_timeout=config['boot'].get('menu_timeout', 3))
     final = out / 'boot.img'
     image.replace(final)
     (out / 'disk').rmdir()

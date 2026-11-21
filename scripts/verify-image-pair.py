@@ -5,6 +5,7 @@ import hashlib
 import json
 import mmap
 import struct
+import tomllib
 from pathlib import Path
 
 
@@ -102,6 +103,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
     parser.add_argument('--report', type=Path)
+    parser.add_argument('--cpu-profile', type=Path, help='require the boot ADT CPU/GIC layout to match this VM manifest')
     args = parser.parse_args()
     folder = args.directory
     manifest = json.loads((folder / 'manifest.json').read_text())
@@ -127,7 +129,17 @@ def main():
     assert layout['system']['uuid'].upper().encode() in adt.upper(), 'ADT root UUID/disk.json mismatch'
     checks['adt_root_uuid_match'] = True
     checks['adt_sha256'] = hashlib.sha256(adt).hexdigest()
+    if args.cpu_profile:
+        from recovery_cpu import verify_adt_cpu_profile
+
+        checks['adt_vcpu_count'] = verify_adt_cpu_profile(adt, args.cpu_profile)
     report['boot_menu'] = fat.read('EFI/UniXNU/unixnu.toml').decode()
+    if args.cpu_profile:
+        menu = tomllib.loads(report['boot_menu'])
+        entry, = menu['entry']
+        assert menu['boot']['timeout'] == 0 and menu['boot']['default'] == entry['id'], 'recovery boot does not start immediately'
+        assert 'droidvm-touch-digitizer=0' in entry['args'].split(), 'standard touch input missing from recovery boot'
+        assert 'vgpu-3d=1' in entry['args'].split(), 'native Metal path missing from recovery boot'
     seed = (folder / layout['seed']).read_bytes()
     assert seed[:8] == b'DBRDISK1', 'seed header mismatch'
     seed_version, page, logical, extent_count = struct.unpack_from('<IIQQ', seed, 8)

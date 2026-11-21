@@ -43,6 +43,7 @@ jobs:
             scripts/vmpkg_ci.py
             scripts/vmpkg_tool.py
             scripts/verify-image-pair.py
+            scripts/recovery_cpu.py
             scripts/inspect-empty-seed-store.py
             configs/vmpkg-27.2.json
             configs/vmpkg-27.2-native-recovery.json
@@ -58,7 +59,7 @@ jobs:
             test "$GITHUB_REF_NAME" = redmi-native-recovery
           fi
           for file in scripts/vmpkg_ci.py scripts/vmpkg_tool.py scripts/verify-image-pair.py \
-                      scripts/inspect-empty-seed-store.py configs/vmpkg-27.2.json \
+                      scripts/recovery_cpu.py scripts/inspect-empty-seed-store.py configs/vmpkg-27.2.json \
                       configs/vmpkg-27.2-native-recovery.json; do test -f "$file"; done
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost
@@ -99,7 +100,11 @@ jobs:
             | zstd -d -q -c \
             | tar --sparse --no-same-owner --no-same-permissions -C "$WORK/raw" -xf - -- \
                 boot.img manifest.json kernel.macho.trustcache data-store.img scratch-data.img disk.json
-          python3 scripts/verify-image-pair.py "$WORK/raw" --report "$WORK/private/source-pair-validation.json"
+          profile_args=()
+          if [ -n "$VMPKG_CANDIDATE_COMMIT" ]; then
+            profile_args=(--cpu-profile configs/vmpkg-27.2-native-recovery.json)
+          fi
+          python3 scripts/verify-image-pair.py "$WORK/raw" --report "$WORK/private/source-pair-validation.json" "${profile_args[@]}"
           python3 scripts/vmpkg_ci.py --work "$WORK" verify-source
           # Reclaim the verified encrypted parts before converting the disk.
           rm -- "$WORK"/parts/image.tar.zst.enc.[0-9][0-9][0-9]

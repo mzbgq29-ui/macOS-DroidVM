@@ -12,11 +12,11 @@
     "hypervisor": "gunyah",
     "protected_vm": "pseudo_unprotected",
     "memory_mb": 5120,
-    "cpu_count": 8,
-    "cpu_affinity": "0=0-7:1=0-7:2=0-7:3=0-7:4=0-7:5=0-7:6=0-7:7=0-7",
+    "cpu_count": 6,
+    "cpu_affinity": "0=0-7:1=0-7:2=0-7:3=0-7:4=0-7:5=0-7",
     "cpu_topology_auto": false,
-    "cpu_capacity": "0=792,1=792,2=792,3=792,4=792,5=792,6=1024,7=1024",
-    "cpu_clusters": "0-5;6-7",
+    "cpu_capacity": "0=792,1=792,2=792,3=792,4=792,5=792",
+    "cpu_clusters": "0-5",
     "cpu_perf_requests": false,
     "balloon": false,
     "pmu": true,
@@ -144,7 +144,10 @@
     "networks": [
       {
         "pkg_network_ref": "net0",
-        "mac_address": "02:44:56:4d:00:01"
+        "dhcp4_lease": {
+          "enabled": true,
+          "offset": 64
+        }
       }
     ],
     "shared_dirs": [],

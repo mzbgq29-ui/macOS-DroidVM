@@ -393,7 +393,13 @@ jobs:
         run: |
           scripts/ci-blob.sh unpack . "$RUNNER_TEMP/kc.tar.zst.enc.000"
           zstd -d -q -c "$RUNNER_TEMP/bundles.tar.zst" | tar -xf -
+          if [ "$GITHUB_REF_NAME" = redmi-native-recovery ]; then
+            export MACOS_RECOVERY_CPU_PROFILE="$PWD/configs/vmpkg-27.2-native-recovery.json"
+          fi
           python3 scripts/product.py boot
+          if [ -n "${MACOS_RECOVERY_CPU_PROFILE:-}" ]; then
+            PYTHONPATH=scripts python3 -c 'import os; from pathlib import Path; from recovery_cpu import verify_adt_cpu_profile; print("Boot ADT vCPUs verified:", verify_adt_cpu_profile(Path("out/app/kernel.macho.adt").read_bytes(), os.environ["MACOS_RECOVERY_CPU_PROFILE"]))'
+          fi
           python3 scripts/product.py stage
       - name: Pack the image
         working-directory: ws
